@@ -1,0 +1,48 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Background: deep dark with subtle blue-midnight tint -->
+    <radialGradient id="bg" cx="512" cy="480" r="600" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#16162a"/>
+      <stop offset="100%" stop-color="#080810"/>
+    </radialGradient>
+    <!-- Subtle center bloom behind bars -->
+    <radialGradient id="bloom" cx="512" cy="512" r="260" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#5b7fff" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#5b7fff" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Bar fill: cool white with slight upward fade -->
+    <linearGradient id="bar" x1="0" y1="288" x2="0" y2="736" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#c8d6ff"/>
+    </linearGradient>
+    <!-- Specular top-of-icon shine -->
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="320" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background fill -->
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- Subtle inner border ring for depth (faint, like iOS icon edge) -->
+  <rect x="1" y="1" width="1022" height="1022" fill="none" stroke="white" stroke-opacity="0.05" stroke-width="2"/>
+
+  <!-- Center bloom glow -->
+  <ellipse cx="512" cy="512" rx="320" ry="240" fill="url(#bloom)"/>
+
+  <!-- Waveform bars — pill shapes, symmetric, centered -->
+  <!-- Bar 1 (leftmost): shortest -->
+  <rect x="276" y="428" width="72" height="168" rx="36" fill="url(#bar)" opacity="0.55"/>
+  <!-- Bar 2: medium -->
+  <rect x="376" y="366" width="72" height="292" rx="36" fill="url(#bar)" opacity="0.78"/>
+  <!-- Bar 3 (center): tallest -->
+  <rect x="476" y="288" width="72" height="448" rx="36" fill="url(#bar)" opacity="1"/>
+  <!-- Bar 4: medium -->
+  <rect x="576" y="366" width="72" height="292" rx="36" fill="url(#bar)" opacity="0.78"/>
+  <!-- Bar 5 (rightmost): shortest -->
+  <rect x="676" y="428" width="72" height="168" rx="36" fill="url(#bar)" opacity="0.55"/>
+
+  <!-- Top specular shine overlay -->
+  <rect width="1024" height="320" fill="url(#shine)"/>
+</svg>

@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings",
+  "description": "Capability granted to the settings window",
+  "windows": ["settings"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "store:allow-get",
+    "store:allow-set"
+  ]
+}

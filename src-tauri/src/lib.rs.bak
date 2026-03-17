@@ -1,0 +1,745 @@
+#![allow(unexpected_cfgs)]
+
+mod audio;
+mod cleanup;
+mod hotkey_listener;
+mod settings;
+mod transcribe;
+mod typer;
+
+use anyhow::Result;
+use audio::AudioRecorder;
+use cleanup::CleanupClient;
+use settings::Settings;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{Emitter, Manager};
+use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_store::StoreExt;
+use transcribe::WhisperModel;
+
+// ─── State machine ────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+enum ListenMode {
+    Toggle,
+    Ptt,
+}
+
+/// Single source of truth for overlay state, serialized as a tagged union.
+/// Wire format: { "state": "listening", "mode": "toggle" } etc.
+#[derive(serde::Serialize, Clone)]
+#[serde(tag = "state", rename_all = "camelCase")]
+#[allow(dead_code)] // Loading reserved for early-hotkey feedback
+enum NeumaState {
+    Idle,
+    Loading,
+    Listening { mode: ListenMode },
+    Transcribing,
+    Cleaning,
+    Done,
+    Error { message: String },
+}
+
+#[derive(serde::Serialize, Clone)]
+struct AudioLevelPayload {
+    level: f32,
+}
+
+// ─── Application state ────────────────────────────────────────────────────────
+
+struct AppState {
+    settings: Settings,
+    recorder: Option<AudioRecorder>,
+    cleanup_client: Arc<CleanupClient>,
+}
+
+impl AppState {
+    fn new(settings: Settings) -> Self {
+        Self {
+            settings,
+            recorder: None,
+            cleanup_client: Arc::new(CleanupClient::new()),
+        }
+    }
+}
+
+type SharedState = Arc<Mutex<AppState>>;
+
+// Whisper lives behind its own mutex so the background load thread and the
+// hotkey pipeline never contend with settings or recorder access.
+type SharedWhisper = Arc<Mutex<Option<Arc<WhisperModel>>>>;
+
+// Keeps the tray icon and its menu items alive for the app lifetime.
+struct TrayState {
+    tray: tauri::tray::TrayIcon,
+    launch_at_login_item: CheckMenuItem<tauri::Wry>,
+    /// Present only when Accessibility was NOT granted at startup (macOS).
+    ax_item: Option<MenuItem<tauri::Wry>>,
+}
+
+// ─── Accessibility helpers ────────────────────────────────────────────────────
+
+/// Returns true if the process has been granted Accessibility (AX) permission.
+/// On non-macOS platforms always returns true (not applicable).
+fn ax_is_process_trusted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn AXIsProcessTrusted() -> bool;
+        }
+        unsafe { AXIsProcessTrusted() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+fn emit_state(app: &tauri::AppHandle, state: NeumaState) {
+    if let Err(e) = app.emit("neuma://state", state) {
+        log::error!("failed to emit state event: {e}");
+    }
+}
+
+fn emit_audio_level(app: &tauri::AppHandle, level: f32) {
+    let payload = AudioLevelPayload { level };
+    if let Err(e) = app.emit("neuma://audio-level", payload) {
+        log::error!("failed to emit audio-level event: {e}");
+    }
+}
+
+fn resolve_model_path(app: &tauri::AppHandle, relative: &str) -> PathBuf {
+    // If it's already absolute, use it directly
+    let p = PathBuf::from(relative);
+    if p.is_absolute() {
+        return p;
+    }
+
+    // Try app data directory
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        let candidate = data_dir.join(relative);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    // Try working directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join(relative);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    // Try directory of the running executable (useful in dev)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // Walk up to find project root (contains src-tauri/)
+            let mut dir = exe_dir;
+            for _ in 0..6 {
+                let candidate = dir.join(relative);
+                if candidate.exists() {
+                    return candidate;
+                }
+                match dir.parent() {
+                    Some(p) => dir = p,
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // Last resort: return relative path as-is
+    PathBuf::from(relative)
+}
+
+/// On macOS, `alwaysOnTop` only sets NSWindowLevel.floating (level 3), which
+/// does NOT appear above fullscreen apps. We need two things:
+///   1. A higher window level (NSWindowLevel.screenSaver = 2000)
+///   2. NSWindowCollectionBehaviorCanJoinAllFullScreenSpaces (1 << 9 = 512)
+///      so the window enters the fullscreen Space instead of staying on the
+///      desktop Space behind it.
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn set_macos_overlay_level(window: &tauri::WebviewWindow) {
+    use objc::{msg_send, sel, sel_impl};
+
+    if let Ok(ptr) = window.ns_window() {
+        let ns_window = ptr as *mut objc::runtime::Object;
+        unsafe {
+            // Screen-saver level (2000) floats above everything including fullscreen apps.
+            let _: () = msg_send![ns_window, setLevel: 2000_i64];
+
+            // Read current behavior set by Tauri (e.g. CanJoinAllSpaces from
+            // set_visible_on_all_workspaces) and OR in our required bits instead
+            // of replacing, so we don't undo Tauri's settings.
+            //   NSWindowCollectionBehaviorCanJoinAllFullScreenSpaces = 1 << 9 = 512
+            //   NSWindowCollectionBehaviorStationary                 = 1 << 4 = 16
+            //   NSWindowCollectionBehaviorIgnoresCycle               = 1 << 6 = 64
+            let current: u64 = msg_send![ns_window, collectionBehavior];
+            let _: () = msg_send![ns_window, setCollectionBehavior: current | 512 | 16 | 64];
+        }
+    }
+}
+
+fn position_overlay_bottom_center(app: &tauri::AppHandle) -> Result<()> {
+    use tauri::LogicalPosition;
+
+    let window = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| anyhow::anyhow!("overlay window not found"))?;
+
+    // Find the monitor containing the cursor so the overlay appears on whichever
+    // screen the user is actively working on. Fall back to primary monitor.
+    let monitors = window.available_monitors()?;
+    let cursor = window.cursor_position().ok();
+
+    let target_monitor = cursor
+        .and_then(|c| {
+            monitors.iter().find(|m| {
+                let pos = m.position();
+                let size = m.size();
+                c.x >= pos.x as f64
+                    && c.x < (pos.x + size.width as i32) as f64
+                    && c.y >= pos.y as f64
+                    && c.y < (pos.y + size.height as i32) as f64
+            })
+        })
+        .cloned()
+        .or_else(|| window.primary_monitor().ok().flatten());
+
+    if let Some(monitor) = target_monitor {
+        let scale = monitor.scale_factor();
+        let pos = monitor.position();
+        let screen_size = monitor.size();
+
+        let monitor_x = pos.x as f64 / scale;
+        let monitor_y = pos.y as f64 / scale;
+        let screen_w = screen_size.width as f64 / scale;
+        let screen_h = screen_size.height as f64 / scale;
+
+        let win_size = window.outer_size()?;
+        let win_w = win_size.width as f64 / scale;
+        let win_h = win_size.height as f64 / scale;
+
+        let x = monitor_x + (screen_w - win_w) / 2.0;
+        // 100px from bottom — clears the macOS Dock (typically ~70–80px) plus margin
+        let y = monitor_y + screen_h - win_h - 100.0;
+
+        window.set_position(LogicalPosition::new(x, y))?;
+    }
+
+    Ok(())
+}
+
+// ─── Tauri commands ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_settings(state: tauri::State<SharedState>) -> Settings {
+    state.lock().unwrap().settings.clone()
+}
+
+#[tauri::command]
+fn save_settings(
+    new_settings: Settings,
+    state: tauri::State<SharedState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let launch_at_login = new_settings.launch_at_login;
+    {
+        let mut s = state.lock().unwrap();
+        s.settings = new_settings.clone();
+    }
+
+    // Sync autostart state
+    let autolaunch = app.autolaunch();
+    let currently_enabled = autolaunch.is_enabled().unwrap_or(false);
+    if launch_at_login && !currently_enabled {
+        let _ = autolaunch.enable();
+    } else if !launch_at_login && currently_enabled {
+        let _ = autolaunch.disable();
+    }
+
+    // Update tray checkmark to match
+    if let Some(tray_state) = app.try_state::<Mutex<TrayState>>() {
+        if let Ok(ts) = tray_state.lock() {
+            let _ = ts.launch_at_login_item.set_checked(launch_at_login);
+        }
+    }
+
+    // Persist via tauri-plugin-store
+    if let Ok(store) = app.store("settings.json") {
+        let v = serde_json::to_value(&new_settings).map_err(|e| e.to_string())?;
+        store.set("settings", v);
+        store.save().map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+fn cancel_recording(state: tauri::State<SharedState>, app: tauri::AppHandle) {
+    // Drop the recorder — stops audio capture and the level-polling loop
+    {
+        let mut s = state.lock().unwrap();
+        s.recorder = None;
+    }
+    // Emit idle first so the React exit animation plays, then hide the window
+    // after the animation completes (~300ms matches pillVariants.exit duration).
+    emit_state(&app, NeumaState::Idle);
+    hide_overlay_after_delay(app, Duration::from_millis(300));
+}
+
+// ─── Dictation pipeline ───────────────────────────────────────────────────────
+
+/// Called when the hotkey is pressed. Shows overlay and starts recording.
+fn on_hotkey_press(app: tauri::AppHandle, state: SharedState) {
+    // All window operations must run on the main thread on macOS.
+    // The rdev listener fires this callback on a background thread, so we
+    // dispatch window work to the main thread before touching NSWindow.
+    let app_for_window = app.clone();
+    app.run_on_main_thread(move || {
+        if let Err(e) = position_overlay_bottom_center(&app_for_window) {
+            log::warn!("failed to position overlay: {e}");
+        }
+        if let Some(win) = app_for_window.get_webview_window("overlay") {
+            let _ = win.set_visible_on_all_workspaces(true);
+            let _ = win.show();
+            // Must be called AFTER show/set_visible_on_all_workspaces — both
+            // can overwrite NSWindow level and collection behavior.
+            #[cfg(target_os = "macos")]
+            set_macos_overlay_level(&win);
+        }
+    })
+    .ok();
+
+    // Start audio recorder
+    match AudioRecorder::start() {
+        Ok(recorder) => {
+            {
+                let mut s = state.lock().unwrap();
+                s.recorder = Some(recorder);
+            }
+            emit_state(&app, NeumaState::Listening { mode: ListenMode::Toggle });
+
+            // Spawn audio level polling task (~10 events/sec)
+            let app_clone = app.clone();
+            let state_clone = Arc::clone(&state);
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let level = {
+                        let s = state_clone.lock().unwrap();
+                        s.recorder.as_ref().map(|r| r.level())
+                    };
+                    match level {
+                        Some(l) => emit_audio_level(&app_clone, l),
+                        None => break, // recorder was taken — hotkey released
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+        }
+        Err(e) => {
+            log::error!("failed to start audio recorder: {e}");
+            emit_state(&app, NeumaState::Error {
+                message: "Microphone not found or access denied. Check System Settings → Privacy → Microphone.".into(),
+            });
+            hide_overlay_after_delay(app, Duration::from_secs(2));
+        }
+    }
+}
+
+/// Called when the hotkey is released. Stops recording and runs the pipeline.
+fn on_hotkey_release(app: tauri::AppHandle, state: SharedState, whisper: SharedWhisper) {
+    // Take the recorder out of state so the level-polling loop stops
+    let recorder = {
+        let mut s = state.lock().unwrap();
+        s.recorder.take()
+    };
+
+    let Some(recorder) = recorder else {
+        // No active recording — nothing to do
+        return;
+    };
+
+    // Snapshot the Arc — if None the model is still loading (or missing)
+    let whisper = whisper.lock().unwrap().clone();
+
+    let Some(whisper) = whisper else {
+        emit_state(&app, NeumaState::Error {
+            message: "Whisper model still loading — wait a moment and try again.".into(),
+        });
+        hide_overlay_after_delay(app, Duration::from_secs(2));
+        return;
+    };
+
+    let (cleanup_enabled, cf_worker_url) = {
+        let s = state.lock().unwrap();
+        (s.settings.cleanup_enabled, s.settings.cf_worker_url.clone())
+    };
+    let cleanup_client = {
+        let s = state.lock().unwrap();
+        Arc::clone(&s.cleanup_client)
+    };
+
+    emit_state(&app, NeumaState::Transcribing);
+
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Stop recording and get PCM
+        let pcm = match recorder.stop() {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("recorder stop failed: {e}");
+                emit_state(&app_clone, NeumaState::Error {
+                    message: "Recording stopped unexpectedly.".into(),
+                });
+                hide_overlay_after_delay(app_clone, Duration::from_secs(2));
+                return;
+            }
+        };
+
+        if pcm.is_empty() {
+            emit_state(&app_clone, NeumaState::Error {
+                message: "Nothing was captured. Try speaking closer to the mic.".into(),
+            });
+            hide_overlay_after_delay(app_clone, Duration::from_secs(2));
+            return;
+        }
+
+        // Transcribe (blocking — run on thread pool)
+        let whisper_clone = Arc::clone(&whisper);
+        let transcript = match tokio::task::spawn_blocking(move || whisper_clone.transcribe(&pcm))
+            .await
+        {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                log::error!("transcription failed: {e}");
+                emit_state(&app_clone, NeumaState::Error {
+                    message: "Transcription failed. Is the Whisper model installed?".into(),
+                });
+                hide_overlay_after_delay(app_clone, Duration::from_secs(2));
+                return;
+            }
+            Err(e) => {
+                log::error!("transcription task panicked: {e}");
+                emit_state(&app_clone, NeumaState::Error {
+                    message: "Transcription crashed unexpectedly.".into(),
+                });
+                hide_overlay_after_delay(app_clone, Duration::from_secs(2));
+                return;
+            }
+        };
+
+        if transcript.is_empty() {
+            emit_state(&app_clone, NeumaState::Error {
+                message: "Nothing was picked up. Speak more clearly or check your mic.".into(),
+            });
+            hide_overlay_after_delay(app_clone, Duration::from_secs(2));
+            return;
+        }
+
+        // Optional cleanup via CF Worker
+        let final_text = if cleanup_enabled && !cf_worker_url.is_empty() {
+            let online = cleanup_client.is_online().await;
+            if online {
+                emit_state(&app_clone, NeumaState::Cleaning);
+                match cleanup_client.clean(&transcript, &cf_worker_url).await {
+                    Ok(cleaned) => cleaned,
+                    Err(e) => {
+                        log::warn!("cleanup failed, using raw transcript: {e}");
+                        transcript
+                    }
+                }
+            } else {
+                log::info!("offline — skipping cleanup");
+                transcript
+            }
+        } else {
+            transcript
+        };
+
+        // Inject text via clipboard paste
+        let text_for_inject = final_text.clone();
+        match tokio::task::spawn_blocking(move || typer::inject(&text_for_inject)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::error!("text inject failed: {e}");
+                emit_state(&app_clone, NeumaState::Error {
+                    message: "Couldn't insert text. Make sure a text field is focused.".into(),
+                });
+                hide_overlay_after_delay(app_clone, Duration::from_secs(2));
+                return;
+            }
+            Err(e) => {
+                log::error!("text inject task panicked: {e}");
+                emit_state(&app_clone, NeumaState::Error {
+                    message: "Text injection crashed unexpectedly.".into(),
+                });
+                hide_overlay_after_delay(app_clone, Duration::from_secs(2));
+                return;
+            }
+        }
+
+        emit_state(&app_clone, NeumaState::Done);
+
+        // Hide after 2.2s — frontend fades at 2s, window hides here
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        if let Some(win) = app_clone.get_webview_window("overlay") {
+            let _ = win.hide();
+        }
+        emit_state(&app_clone, NeumaState::Idle);
+    });
+}
+
+fn hide_overlay_after_delay(app: tauri::AppHandle, delay: Duration) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if let Some(win) = app.get_webview_window("overlay") {
+            let _ = win.hide();
+        }
+        emit_state(&app, NeumaState::Idle);
+    });
+}
+
+// ─── Library entry point ──────────────────────────────────────────────────────
+
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .setup(|app| {
+            // ── Load settings ──────────────────────────────────────────────
+            let mut settings = Settings::default();
+
+            if let Ok(store) = app.store("settings.json") {
+                if let Some(v) = store.get("settings") {
+                    if let Ok(s) = serde_json::from_value::<Settings>(v) {
+                        settings = s;
+                    }
+                }
+            }
+
+            let state = Arc::new(Mutex::new(AppState::new(settings.clone())));
+            app.manage(state.clone());
+
+            // ── Whisper model — load on background thread ──────────────────
+            // setup() returns immediately; the model populates SharedWhisper
+            // once the thread-pool task completes (~3-10s for Turbo).
+            let shared_whisper: SharedWhisper = Arc::new(Mutex::new(None));
+            app.manage(shared_whisper.clone());
+
+            let model_path = resolve_model_path(app.handle(), &settings.model_path);
+            if model_path.exists() {
+                let whisper_for_load = Arc::clone(&shared_whisper);
+                tauri::async_runtime::spawn(async move {
+                    log::info!("loading Whisper model from {model_path:?}");
+                    match tokio::task::spawn_blocking(move || WhisperModel::load(&model_path)).await {
+                        Ok(Ok(model)) => {
+                            *whisper_for_load.lock().unwrap() = Some(Arc::new(model));
+                            log::info!("Whisper model loaded successfully");
+                        }
+                        Ok(Err(e)) => log::error!("failed to load Whisper model: {e}"),
+                        Err(e) => log::error!("Whisper model load task panicked: {e}"),
+                    }
+                });
+            } else {
+                log::warn!(
+                    "Whisper model not found at {model_path:?}. \
+                     Download ggml-whisper-turbo.bin and update model_path in settings."
+                );
+            }
+
+            // ── macOS: ensure overlay floats above fullscreen apps ─────────
+            #[cfg(target_os = "macos")]
+            if let Some(win) = app.get_webview_window("overlay") {
+                set_macos_overlay_level(&win);
+            }
+
+            // ── Menu bar tray icon ─────────────────────────────────────────
+            let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+            let ax_trusted = ax_is_process_trusted();
+
+            let launch_item = CheckMenuItem::with_id(
+                app,
+                "autostart",
+                "Launch at Login",
+                true,
+                autostart_enabled,
+                None::<&str>,
+            )?;
+            let quit_item =
+                MenuItem::with_id(app, "quit", "Quit Neuma", true, None::<&str>)?;
+            let sep = PredefinedMenuItem::separator(app)?;
+
+            // Accessibility warning item — only included when not trusted at startup.
+            let (menu, ax_item_opt) = if !ax_trusted {
+                let ax_item = MenuItem::with_id(
+                    app,
+                    "open_accessibility",
+                    "⚠ Grant Accessibility Access",
+                    true,
+                    None::<&str>,
+                )?;
+                let ax_sep = PredefinedMenuItem::separator(app)?;
+                let m = Menu::with_items(app, &[&ax_item, &ax_sep, &launch_item, &sep, &quit_item])?;
+                (m, Some(ax_item))
+            } else {
+                let m = Menu::with_items(app, &[&launch_item, &sep, &quit_item])?;
+                (m, None)
+            };
+
+            let tooltip = if ax_trusted {
+                "Neuma — click to open menu"
+            } else {
+                "Neuma — ⚠ Accessibility not granted"
+            };
+
+            let tray_icon_bytes = include_bytes!("../icons/tray-icon.png");
+            let tray_image = tauri::image::Image::from_bytes(tray_icon_bytes)
+                .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
+
+            // Shared flag: flips to true when AX is granted after launch (restart required).
+            let ax_restart_required = Arc::new(AtomicBool::new(false));
+            let ax_restart_for_event = Arc::clone(&ax_restart_required);
+
+            let launch_item_clone = launch_item.clone();
+            let ax_item_clone = ax_item_opt.clone();
+            let tray = TrayIconBuilder::new()
+                .icon(tray_image)
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .tooltip(tooltip)
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    "quit" => app.exit(0),
+                    "autostart" => {
+                        let autolaunch = app.autolaunch();
+                        let enabled = autolaunch.is_enabled().unwrap_or(false);
+                        if enabled {
+                            let _ = autolaunch.disable();
+                            let _ = launch_item_clone.set_checked(false);
+                        } else {
+                            let _ = autolaunch.enable();
+                            let _ = launch_item_clone.set_checked(true);
+                        }
+                        // Keep settings.json in sync
+                        if let Some(shared) = app.try_state::<SharedState>() {
+                            let mut s = shared.lock().unwrap();
+                            s.settings.launch_at_login = !enabled;
+                            let new_settings = s.settings.clone();
+                            drop(s);
+                            if let Ok(store) = app.store("settings.json") {
+                                if let Ok(v) = serde_json::to_value(&new_settings) {
+                                    store.set("settings", v);
+                                    let _ = store.save();
+                                }
+                            }
+                        }
+                    }
+                    "open_accessibility" => {
+                        if ax_restart_for_event.load(Ordering::Relaxed) {
+                            // Granted after launch — quit so user can relaunch
+                            app.exit(0);
+                        } else {
+                            // Not yet granted — open System Settings
+                            #[cfg(target_os = "macos")]
+                            let _ = std::process::Command::new("open")
+                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                                .spawn();
+                        }
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            app.manage(Mutex::new(TrayState {
+                tray,
+                launch_at_login_item: launch_item,
+                ax_item: ax_item_clone,
+            }));
+
+            // ── Accessibility poll (macOS, only when not trusted at startup) ──
+            // If the user grants Accessibility while the app is running, rdev's
+            // CGEventTap has already failed — the hotkey won't work until restart.
+            // Poll every 5s; when it flips to trusted, update the tray item to
+            // prompt a restart instead of opening settings.
+            if !ax_trusted {
+                let app_poll = app.handle().clone();
+                let ax_restart_for_poll = Arc::clone(&ax_restart_required);
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        if ax_is_process_trusted() {
+                            ax_restart_for_poll.store(true, Ordering::Relaxed);
+                            if let Some(ts) = app_poll.try_state::<Mutex<TrayState>>() {
+                                if let Ok(ts) = ts.lock() {
+                                    if let Some(ref item) = ts.ax_item {
+                                        let _ = item.set_text("↺ Restart Neuma to activate hotkey");
+                                    }
+                                    let _ = ts.tray.set_tooltip(Some("Neuma — restart to activate hotkey"));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+
+            // ── Hotkey listener via rdev (CGEventTap on macOS) ────────────
+            // Tap (< 400ms): toggle — starts recording; next tap stops.
+            // Hold (≥ 400ms): push-to-talk — stops recording on release.
+            // Supports fn, standalone Alt/Option, etc. that muda cannot register.
+            // Requires Accessibility permission on macOS.
+            {
+                let app_press = app.handle().clone();
+                let state_press = Arc::clone(&state);
+                let app_release = app.handle().clone();
+                let state_release = Arc::clone(&state);
+                let whisper_release = Arc::clone(&shared_whisper);
+                let app_ptt = app.handle().clone();
+
+                hotkey_listener::start_listener(
+                    &settings.hotkey,
+                    move || on_hotkey_press(app_press.clone(), Arc::clone(&state_press)),
+                    move || on_hotkey_release(
+                        app_release.clone(),
+                        Arc::clone(&state_release),
+                        Arc::clone(&whisper_release),
+                    ),
+                    move || emit_state(&app_ptt, NeumaState::Listening { mode: ListenMode::Ptt }),
+                );
+                log::info!("hotkey listener started for key: {}", settings.hotkey);
+            }
+
+            // ── Hide from Dock — app lives only in menu bar ────────────────
+            // Must run after windows are set up to avoid NSApp state issues.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            save_settings,
+            get_app_version,
+            cancel_recording,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Neuma");
+}

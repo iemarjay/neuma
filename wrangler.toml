@@ -1,0 +1,7 @@
+name = "neuma-cleanup"
+main = "worker/index.ts"
+compatibility_date = "2026-03-16"
+account_id = "9eaa877bd6c6e77ff3913a176e4322a9"
+
+[ai]
+binding = "AI"

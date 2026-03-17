@@ -1,0 +1,2 @@
+[env]
+CMAKE_TOOLCHAIN_FILE = { value = "arm64.cmake", relative = true }

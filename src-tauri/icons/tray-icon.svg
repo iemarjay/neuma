@@ -1,0 +1,10 @@
+<svg width="22" height="22" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- 3-bar waveform template icon for macOS menu bar -->
+  <!-- Pure black — macOS recolors template images automatically -->
+  <!-- Bar 1 (left): short -->
+  <rect x="2" y="7" width="4" height="8" rx="2" fill="black"/>
+  <!-- Bar 2 (center): tall -->
+  <rect x="9" y="3" width="4" height="16" rx="2" fill="black"/>
+  <!-- Bar 3 (right): short -->
+  <rect x="16" y="7" width="4" height="8" rx="2" fill="black"/>
+</svg>

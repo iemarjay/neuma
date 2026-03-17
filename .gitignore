@@ -1,0 +1,59 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+.cache/
+
+# TypeScript
+*.tsbuildinfo
+
+# Vite
+.vite/
+
+# Rust / Cargo
+target/
+Cargo.lock
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/gen/
+
+# Models — GGUF files are large, not committed
+models/*.bin
+models/*.gguf
+models/*.ggml
+!models/.gitkeep
+
+# Cloudflare / Wrangler
+.wrangler/
+worker/dist/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
