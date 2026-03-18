@@ -12,8 +12,8 @@ const MODEL_URL: &str =
 const MODEL_FILENAME: &str = "ggml-whisper-turbo.bin";
 
 const LLM_MODEL_URL: &str =
-    "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf";
-const LLM_MODEL_FILENAME: &str = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
+    "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+const LLM_MODEL_FILENAME: &str = "llama-3.2-1b-instruct-q4_k_m.gguf";
 
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]

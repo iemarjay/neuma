@@ -29,9 +29,7 @@ pub struct LlmCleanupModel {
 impl LlmCleanupModel {
     pub fn load(path: &Path) -> Result<Self> {
         let backend = LlamaBackend::init().context("failed to init llama backend")?;
-        // Start with CPU-only (n_gpu_layers=0) to rule out Metal backend issues.
-        // Once confirmed stable we can raise this to offload layers to GPU.
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(99);
         let model = LlamaModel::load_from_file(&backend, path, &model_params)
             .with_context(|| format!("llama: failed to load model from {path:?}"))?;
         Ok(Self { backend, model })
@@ -48,26 +46,22 @@ impl LlmCleanupModel {
     /// extension, adding significant complexity for marginal gain given typical
     /// dictation frequency (once every several seconds at most).
     pub fn clean(&self, text: &str) -> Result<String> {
-        // Qwen2.5-Instruct uses ChatML format
+        // Llama 3.x instruct format
         let prompt = format!(
-            "<|im_start|>system\n\
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n\
 You are a voice dictation cleanup engine. Transform raw speech transcription into clean, natural written text.\n\
 \n\
 Rules:\n\
 - Remove filler words (um, uh, like, you know, basically, literally)\n\
-- Remove false starts and self-corrections — keep only the intended version (e.g. \"let's meet at 2... actually 3\" → \"let's meet at 3\")\n\
 - Fix punctuation and capitalization naturally\n\
-- Preserve the speaker's tone and vocabulary — do not rewrite or rephrase\n\
 - Convert spoken list cues (\"one... two...\" or \"first... second...\") into a newline-separated list using \"- \" bullets\n\
 - Convert \"new line\" or \"new paragraph\" into actual line breaks\n\
 - Convert spoken punctuation (\"exclamation point\", \"question mark\", \"comma\", \"period\") into the actual symbol\n\
 - Do not add, infer, or expand on anything not spoken\n\
-- Output only the cleaned text, nothing else\
-<|im_end|>\n\
-<|im_start|>user\n\
-{text}\
-<|im_end|>\n\
-<|im_start|>assistant\n"
+- Output only the cleaned text, nothing else<|eot_id|>\
+<|start_header_id|>user<|end_header_id|>\n\n\
+{text}<|eot_id|>\
+<|start_header_id|>assistant<|end_header_id|>\n\n"
         );
 
         let tokens: Vec<LlamaToken> = self
@@ -125,7 +119,7 @@ Rules:\n\
                 .token_to_piece(token, &mut decoder, true, None)
                 .unwrap_or_default();
 
-            if piece.contains("<|im_end|>") {
+            if piece.contains("<|eot_id|>") {
                 break;
             }
 
