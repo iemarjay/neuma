@@ -33,7 +33,7 @@ impl WhisperModel {
             .context("failed to create Whisper state")?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(Some("auto"));
+        params.set_language(Some("en"));
         params.set_translate(false);
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -47,8 +47,12 @@ impl WhisperModel {
             "Transcription of clear spoken English. Proper punctuation and capitalization. \
              No filler words.",
         );
-        // Single-threaded — Tauri already manages threads via Tokio
-        params.set_n_threads(1);
+        let n_threads = (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4) / 2)
+            .max(2)
+            .min(8) as i32;
+        params.set_n_threads(n_threads);
 
         state
             .full(params, pcm)
