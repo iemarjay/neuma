@@ -1,6 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 mod audio;
+mod ax;
 mod cleanup;
 mod commands;
 mod downloader;
@@ -57,6 +58,8 @@ struct AppState {
     cleanup_client: Arc<CleanupClient>,
     download_cancel: Arc<AtomicBool>,
     llm_download_cancel: Arc<AtomicBool>,
+    /// Text before the cursor captured at recording start, used for context-aware cleanup.
+    context: Option<String>,
 }
 
 impl AppState {
@@ -67,6 +70,7 @@ impl AppState {
             cleanup_client: Arc::new(CleanupClient::new()),
             download_cancel: Arc::new(AtomicBool::new(false)),
             llm_download_cancel: Arc::new(AtomicBool::new(false)),
+            context: None,
         }
     }
 }
@@ -109,6 +113,7 @@ pub fn run() {
             commands::cancel_llm_model_download,
             commands::test_cleanup_connection,
             commands::open_settings_window,
+            commands::stop_recording_and_transcribe,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Neuma")
@@ -240,6 +245,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     {
         let app_press = app.handle().clone();
         let state_press = Arc::clone(&state);
+        let whisper_press = Arc::clone(&shared_whisper);
+        let loading_press = Arc::clone(&whisper_loading);
+        let llm_press = Arc::clone(&shared_llm);
         let app_release = app.handle().clone();
         let state_release = Arc::clone(&state);
         let whisper_release = Arc::clone(&shared_whisper);
@@ -249,7 +257,13 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
         hotkey_listener::start_listener(
             &settings.hotkey,
-            move || pipeline::on_hotkey_press(app_press.clone(), Arc::clone(&state_press)),
+            move || pipeline::on_hotkey_press(
+                app_press.clone(),
+                Arc::clone(&state_press),
+                Arc::clone(&whisper_press),
+                Arc::clone(&loading_press),
+                Arc::clone(&llm_press),
+            ),
             move || pipeline::on_hotkey_release(
                 app_release.clone(),
                 Arc::clone(&state_release),

@@ -29,14 +29,20 @@ fn require_accessibility() -> Result<()> {
     )
 }
 
-/// Inject `text` into the currently focused application by:
-/// 1. Saving the current clipboard contents.
-/// 2. Writing `text` to the clipboard.
-/// 3. Simulating the system paste shortcut (Cmd+V on macOS, Ctrl+V elsewhere).
-/// 4. Restoring the original clipboard contents.
+/// Inject `text` into the currently focused application.
+///
+/// On macOS, attempts AX (Accessibility API) injection first — inserts directly
+/// at the cursor with no clipboard side-effects. Falls back to clipboard + Cmd+V
+/// for apps with shallow AX trees (Electron, browsers, terminals).
 pub fn inject(text: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     require_accessibility()?;
+
+    // TODO: AX injection (insert directly into native text fields without touching
+    // the clipboard). Disabled until we can guarantee the focused element at
+    // inject time is the target app and not the Neuma overlay.
+    // When re-enabling: call crate::ax::inject(text) here and return early on Ok.
+
     let mut clipboard = Clipboard::new().context("failed to open clipboard")?;
 
     // Save current clipboard text. Non-text content (images, HTML, files) cannot
