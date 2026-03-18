@@ -6,7 +6,7 @@ use tauri_plugin_store::StoreExt;
 
 use tauri::{Emitter, Manager};
 
-use super::{downloader, NeumaState, SharedLlm, SharedState, SharedWhisper};
+use super::{downloader, NeumaState, SharedLlm, SharedState, SharedWhisper, WhisperLoading};
 use super::cleanup::CleanupClient;
 use super::local_cleanup::LlmCleanupModel;
 use super::settings::Settings;
@@ -101,6 +101,20 @@ pub(crate) fn cancel_recording(state: tauri::State<SharedState>, app: tauri::App
     }
     emit_state(&app, NeumaState::Idle);
     hide_overlay_after_delay(app, Duration::from_millis(300));
+}
+
+/// Stop recording and run the full transcribe → cleanup → inject pipeline.
+/// Called by the Done (✓) button in the overlay — equivalent to VAD auto-stop.
+#[tauri::command]
+pub(crate) fn stop_recording_and_transcribe(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) {
+    let whisper = app.state::<SharedWhisper>().inner().clone();
+    let whisper_loading = app.state::<WhisperLoading>().inner().clone();
+    let llm = app.state::<SharedLlm>().inner().clone();
+    let state = Arc::clone(state.inner());
+    super::pipeline::run_pipeline(app, state, whisper, whisper_loading, llm);
 }
 
 // ─── Whisper model ────────────────────────────────────────────────────────────

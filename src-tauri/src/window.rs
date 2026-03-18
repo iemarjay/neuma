@@ -67,7 +67,7 @@ pub(crate) fn create_overlay_window(app: &tauri::AppHandle) -> Result<tauri::Web
         tauri::WebviewUrl::App("index.html".into()),
     )
     .title("Neuma")
-    .inner_size(280.0, 38.0)
+    .inner_size(220.0, 38.0)
     .resizable(false)
     .decorations(false)
     .transparent(true)

@@ -79,15 +79,6 @@ function MicIcon() {
   );
 }
 
-// ─── Sparkle icon ─────────────────────────────────────────────────────────────
-
-function SparkleIcon({ size = 14 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" style={{ flexShrink: 0 }}>
-      <path d="M12 2l2.09 6.26L20 10l-5.91 1.74L12 18l-2.09-6.26L4 10l5.91-1.74L12 2z" />
-    </svg>
-  );
-}
 
 // ─── Waveform ─────────────────────────────────────────────────────────────────
 
@@ -169,34 +160,6 @@ function AnimatedXMark() {
   );
 }
 
-// ─── Animated checkmark ───────────────────────────────────────────────────────
-
-function AnimatedCheckmark() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
-      <motion.circle
-        cx="12" cy="12" r="10"
-        stroke="rgba(160,255,160,0.7)"
-        strokeWidth="1.5"
-        fill="none"
-        initial={{ pathLength: 0, opacity: 0 }}
-        animate={{ pathLength: 1, opacity: 1 }}
-        transition={{ duration: 0.35, ease: "easeOut" }}
-      />
-      <motion.path
-        d="M7 12.5l3.5 3.5 6.5-7"
-        stroke="rgba(180,255,180,0.95)"
-        strokeWidth="2.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        fill="none"
-        initial={{ pathLength: 0, opacity: 0 }}
-        animate={{ pathLength: 1, opacity: 1 }}
-        transition={{ duration: 0.38, ease: "easeOut", delay: 0.2 }}
-      />
-    </svg>
-  );
-}
 
 // ─── State content components ─────────────────────────────────────────────────
 
@@ -276,61 +239,29 @@ function CleaningContent() {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        gap: "10px",
+        gap: "14px",
         padding: "0 20px",
         width: "100%",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "5px", height: "24px" }}>
         {[0, 1, 2].map((i) => (
-          <motion.div
+          <div
             key={i}
-            className="sparkle"
+            className="transcribe-dot"
             style={{
-              color: "rgba(200,190,255,0.90)",
-              display: "flex",
-              alignItems: "center",
+              width: "6px",
+              height: "6px",
+              borderRadius: "50%",
+              background: "rgba(200,185,255,0.85)",
             }}
-            animate={{
-              opacity: [0.3, 1, 0.3],
-              scale: [0.85, 1.2, 0.85],
-            }}
-            transition={{
-              duration: 1.4,
-              repeat: Infinity,
-              ease: "easeInOut",
-              delay: i * 0.2,
-            }}
-          >
-            <SparkleIcon size={i === 1 ? 13 : 10} />
-          </motion.div>
+          />
         ))}
       </div>
     </motion.div>
   );
 }
 
-function DoneContent() {
-  return (
-    <motion.div
-      key="done"
-      variants={contentVariants}
-      initial="hidden"
-      animate="visible"
-      exit="exit"
-      style={{
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: "10px",
-        padding: "0 20px",
-        width: "100%",
-      }}
-    >
-      <AnimatedCheckmark />
-    </motion.div>
-  );
-}
 
 function ErrorContent() {
   return (
@@ -358,7 +289,7 @@ function ErrorContent() {
 function getPillStyle(state: AppStateName): React.CSSProperties {
   const base: React.CSSProperties = {
     width: "fit-content",
-    minWidth: "180px",
+    minWidth: "120px",
     maxWidth: "600px",
     height: "var(--pill-height)",
     borderRadius: "var(--pill-radius)",
@@ -377,10 +308,6 @@ function getPillStyle(state: AppStateName): React.CSSProperties {
     return { ...base, background: "var(--error-bg)", border: "1px solid var(--error-border)" };
   }
 
-  if (state === "done") {
-    return { ...base, background: "rgba(8, 18, 8, 0.82)", border: "1px solid rgba(120,255,120,0.15)" };
-  }
-
   if (state === "cleaning") {
     return { ...base, background: "rgba(12, 10, 20, 0.82)", border: "1px solid rgba(180,160,255,0.15)" };
   }
@@ -392,6 +319,7 @@ function getPillStyle(state: AppStateName): React.CSSProperties {
 
 export default function App() {
   const [appState, setAppState] = useState<AppStateName>("idle");
+  const [listenMode, setListenMode] = useState<ListenMode | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -405,6 +333,12 @@ export default function App() {
       }
 
       setAppState(payload.state);
+
+      if (payload.state === "listening") {
+        setListenMode(payload.mode);
+      } else {
+        setListenMode(null);
+      }
 
 
       if (payload.state === "error") {
@@ -440,7 +374,7 @@ export default function App() {
     };
   }, []);
 
-  const isVisible = appState !== "idle" && appState !== "loading";
+  const isVisible = appState !== "idle" && appState !== "loading" && appState !== "done";
 
   return (
     <div
@@ -454,6 +388,28 @@ export default function App() {
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+        {/* Done button — left of pill, toggle mode only */}
+        <AnimatePresence>
+          {appState === "listening" && listenMode === "toggle" && (
+            <motion.button
+              key="done-outer"
+              initial={{ opacity: 0, scale: 0.7 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.7 }}
+              transition={{ duration: 0.18, ease: "easeOut" }}
+              whileHover={{ scale: 1.1, opacity: 1 }}
+              whileTap={{ scale: 0.88 }}
+              onClick={() => invoke("stop_recording_and_transcribe")}
+              className="done-btn"
+              title="Done"
+            >
+              <svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="1.5,6 4,8.5 9.5,2" />
+              </svg>
+            </motion.button>
+          )}
+        </AnimatePresence>
+
         <AnimatePresence>
           {isVisible && (
             <motion.div
@@ -489,9 +445,6 @@ export default function App() {
                 )}
                 {appState === "cleaning" && (
                   <CleaningContent key="cleaning" />
-                )}
-                {appState === "done" && (
-                  <DoneContent key="done" />
                 )}
                 {appState === "error" && (
                   <ErrorContent key="error" />

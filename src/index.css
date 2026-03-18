@@ -134,7 +134,24 @@ html, body {
   flex: 1;
 }
 
-/* Cancel button — sits beside the pill, outside it */
+/* Done / Cancel buttons — sit beside the pill, outside it */
+.done-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.55);
+  padding: 0;
+  flex-shrink: 0;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+
 .cancel-btn {
   display: flex;
   align-items: center;

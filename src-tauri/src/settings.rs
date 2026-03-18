@@ -23,7 +23,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            hotkey: "alt".to_string(),
+            hotkey: "fn".to_string(),
             cleanup_api_key: String::new(),
             cleanup_mode: "disabled".to_string(),
             launch_at_login: false,
