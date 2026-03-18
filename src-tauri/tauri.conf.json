@@ -1,6 +1,6 @@
 {
   "productName": "Neuma",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "com.neuma.app",
   "build": {
     "beforeDevCommand": "npm run dev",
