@@ -113,14 +113,28 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Neuma")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                let explicit = app
-                    .try_state::<ExplicitQuit>()
-                    .map(|s| s.0.load(Ordering::Relaxed))
-                    .unwrap_or(false);
-                if !explicit {
-                    api.prevent_exit();
+            match event {
+                tauri::RunEvent::Ready => {
+                    // Pin startup and overlay to all Spaces now that the run loop is active.
+                    // setCollectionBehavior called during setup() (before the run loop starts)
+                    // is silently ignored by AppKit — must be applied here.
+                    #[cfg(target_os = "macos")]
+                    for label in ["startup", "overlay"] {
+                        if let Some(win) = app.get_webview_window(label) {
+                            window::pin_to_all_spaces(&win);
+                        }
+                    }
                 }
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    let explicit = app
+                        .try_state::<ExplicitQuit>()
+                        .map(|s| s.0.load(Ordering::Relaxed))
+                        .unwrap_or(false);
+                    if !explicit {
+                        api.prevent_exit();
+                    }
+                }
+                _ => {}
             }
         });
 }

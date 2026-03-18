@@ -24,10 +24,13 @@ pub(crate) fn on_hotkey_press(app: tauri::AppHandle, state: SharedState) {
             log::warn!("failed to position overlay: {e}");
         }
         if let Some(win) = app_for_window.get_webview_window("overlay") {
-            let _ = win.set_visible_on_all_workspaces(true);
-            let _ = win.show();
+            // set_macos_overlay_level sets level + collection behavior + orderFrontRegardless.
+            // Do NOT call win.show() (makeKeyAndOrderFront) or set_visible_on_all_workspaces
+            // after this — either would overwrite the collection behavior we just set.
             #[cfg(target_os = "macos")]
             set_macos_overlay_level(&win);
+            #[cfg(not(target_os = "macos"))]
+            let _ = win.show();
         }
     })
     .ok();

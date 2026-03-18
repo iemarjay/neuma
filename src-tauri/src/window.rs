@@ -39,7 +39,12 @@ pub(crate) fn emit_audio_level(app: &tauri::AppHandle, level: f32) {
 
 /// Emit the error overlay state and send a system notification with the same message.
 pub(crate) fn emit_error(app: &tauri::AppHandle, message: &str) {
-    emit_state(app, NeumaState::Error { message: message.to_string() });
+    emit_state(
+        app,
+        NeumaState::Error {
+            message: message.to_string(),
+        },
+    );
     if let Err(e) = app
         .notification()
         .builder()
@@ -73,9 +78,6 @@ pub(crate) fn create_overlay_window(app: &tauri::AppHandle) -> Result<tauri::Web
     .visible_on_all_workspaces(true)
     .build()?;
 
-    #[cfg(target_os = "macos")]
-    set_macos_overlay_level(&win);
-
     Ok(win)
 }
 
@@ -88,7 +90,7 @@ pub(crate) fn create_startup_window(app: &tauri::AppHandle) -> Result<tauri::Web
         tauri::WebviewUrl::App("index.html".into()),
     )
     .title("Neuma")
-    .inner_size(300.0, 200.0)
+    .inner_size(380.0, 380.0)
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -99,34 +101,45 @@ pub(crate) fn create_startup_window(app: &tauri::AppHandle) -> Result<tauri::Web
     Ok(win)
 }
 
-// ─── Overlay window ───────────────────────────────────────────────────────────
+// ─── macOS window pinning ─────────────────────────────────────────────────────
 
-/// Forces the overlay window into every fullscreen Space on macOS.
+/// Collection behavior applied to every Neuma window.
 ///
-/// Tauri's `alwaysOnTop` only sets NSWindowLevel.floating (3) which is
-/// z-ordered above normal windows but does NOT enter fullscreen Spaces.
-/// Tauri's `visibleOnAllWorkspaces` sets CanJoinAllSpaces (1<<0) which
-/// covers regular Spaces but NOT fullscreen Spaces.
+///   1      = NSWindowCollectionBehaviorCanJoinAllSpaces
+///   64     = NSWindowCollectionBehaviorIgnoresCycle (stay out of Cmd+Tab)
+///   256    = NSWindowCollectionBehaviorFullScreenAuxiliary
+///   262144 = NSWindowCollectionBehaviorCanJoinAllApplications (macOS 13+)
+const COLLECTION_BEHAVIOR: u64 = 1 | 64 | 256 | 262144; // = 262465
+
+/// Pins a window to all Spaces and sets it up to appear in fullscreen Spaces.
+/// Must be called after the event loop is running (RunEvent::Ready), not during
+/// setup() — setCollectionBehavior called before the run loop starts is ignored.
+#[cfg(target_os = "macos")]
+pub(crate) fn pin_to_all_spaces(window: &tauri::WebviewWindow) {
+    use objc::{msg_send, sel, sel_impl};
+    if let Ok(ptr) = window.ns_window() {
+        let ns_window = ptr as *mut objc::runtime::Object;
+        unsafe {
+            let _: () = msg_send![ns_window, setCollectionBehavior: COLLECTION_BEHAVIOR];
+        }
+    }
+}
+
+/// Shows the overlay above fullscreen content.
 ///
-/// What actually works (verified against AppKit headers):
-///   setLevel: 1000  — NSWindowLevel.screenSaver, above fullscreen content
-///   CanJoinAllApplications (1<<18 = 262144, macOS 13+)
-///     "join other apps' sets and full screen spaces when eligible"
-///   IgnoresCycle (1<<6 = 64) — stay out of Cmd+Tab
+/// Sets screenSaver-level z-order and calls `orderFrontRegardless` which —
+/// unlike `makeKeyAndOrderFront` — crosses into fullscreen Spaces without
+/// needing the window to become the key window.
 #[cfg(target_os = "macos")]
 #[allow(unexpected_cfgs)]
 pub(crate) fn set_macos_overlay_level(window: &tauri::WebviewWindow) {
     use objc::{msg_send, sel, sel_impl};
-
     if let Ok(ptr) = window.ns_window() {
         let ns_window = ptr as *mut objc::runtime::Object;
         unsafe {
             let _: () = msg_send![ns_window, setLevel: 1000_i64];
-            let current: u64 = msg_send![ns_window, collectionBehavior];
-            // 64  = NSWindowCollectionBehaviorIgnoresCycle
-            // 256 = NSWindowCollectionBehaviorFullScreenAuxiliary (appear in fullscreen Spaces)
-            // 262144 = NSWindowCollectionBehaviorCanJoinAllApplications (macOS 13+)
-            let _: () = msg_send![ns_window, setCollectionBehavior: current | 64 | 256 | 262144];
+            let _: () = msg_send![ns_window, setCollectionBehavior: COLLECTION_BEHAVIOR];
+            let _: () = msg_send![ns_window, orderFrontRegardless];
         }
     }
 }
@@ -141,13 +154,22 @@ fn dock_bottom_inset_pts() -> f64 {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct NSPoint { x: f64, y: f64 }
+    struct NSPoint {
+        x: f64,
+        y: f64,
+    }
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct NSSize { width: f64, height: f64 }
+    struct NSSize {
+        width: f64,
+        height: f64,
+    }
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct NSRect { origin: NSPoint, size: NSSize }
+    struct NSRect {
+        origin: NSPoint,
+        size: NSSize,
+    }
 
     unsafe {
         let ns_screen: *mut objc::runtime::Object = msg_send![class!(NSScreen), mainScreen];
@@ -240,6 +262,9 @@ pub(crate) fn show_or_create_settings_window(app: &tauri::AppHandle) -> Result<(
         .resizable(false)
         .center()
         .build()?;
+
+        #[cfg(target_os = "macos")]
+        pin_to_all_spaces(&win);
 
         let win_clone = win.clone();
         win.on_window_event(move |event| {
