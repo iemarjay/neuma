@@ -252,20 +252,18 @@ RMS level is computed over the last 1024 samples ~10 times per second and emitte
 
 ## Out of Scope (MVP)
 
-- Settings UI (edit hotkey/CF URL in-app) — edit settings.json directly for now
 - Custom vocabulary / Whisper prompt injection
 - Streaming transcription (partial results while speaking)
 - VAD (voice activity detection) for auto-stop
 - Noise suppression / pre-processing
-- App icon
 
 ## Post-MVP Plan
 
 - **Accessibility API text injection (macOS).** Use `AXUIElement` via `objc2` bindings to inject text directly into focused native text fields, bypassing the clipboard entirely. This mirrors how Wispr Flow works. Trigger only when clipboard injection fails or for native macOS apps (TextEdit, Mail, Notes, Safari address bar). Clipboard path remains the fallback for Electron apps (VS Code, Slack, etc.) which have shallow AX trees. Requires prompting user for Accessibility permission in System Settings and `com.apple.security.temporary-exception.accessibility` entitlement in the signed build.
 - **Personal dictionary.** Store a user-defined list of terms (`dictionary: Vec<String>` in settings) for names, jargon, and unusual spellings. Applied two ways: (1) passed as Whisper `initial_prompt` to bias transcription offline; (2) passed to the CF Worker cleanup prompt as a glossary. Passive auto-learning (detecting post-injection edits via AXUIElement diff and adding changed words automatically) requires AX integration — manual additions via settings are the MVP path.
 - **Context-aware spelling.** Before injecting, read the focused field's existing text via `AXUIElement` and send it alongside the transcript to the CF Worker. The LLM uses names and terms already present in the document/thread to correct Whisper's phonetic guesses (e.g., "Daveed" already in the thread corrects "David" in the transcript). Requires AX integration.
-- Settings UI — in-app editor for hotkey, CF Worker URL, cleanup toggle, model path, dictionary management
+- Settings UI — ✅ done (Settings.tsx window with hotkey, cleanup mode, model download, launch at login)
+- App icon — ✅ done (icns/ico/png set in src-tauri/icons/)
 - Streaming transcription (partial results while speaking)
 - VAD (voice activity detection) for auto-stop
 - Noise suppression / pre-processing
-- App icon
