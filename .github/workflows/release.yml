@@ -48,6 +48,8 @@ jobs:
         run: npm ci
 
       - name: Build
+        env:
+          CMAKE_TOOLCHAIN_FILE: ""
         run: npm run tauri build
 
       - name: Upload installer and publish release
