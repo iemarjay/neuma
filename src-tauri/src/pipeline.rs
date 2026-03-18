@@ -15,18 +15,22 @@ use super::window::{
 #[cfg(target_os = "macos")]
 use super::window::set_macos_overlay_level;
 
-/// Called when the hotkey is pressed. Shows the overlay and starts recording.
-pub(crate) fn on_hotkey_press(app: tauri::AppHandle, state: SharedState) {
-    // Window ops must run on the main thread on macOS (rdev fires on a bg thread).
+/// Called when the hotkey is pressed. Shows the overlay, starts recording,
+/// and spawns the VAD polling loop.
+pub(crate) fn on_hotkey_press(
+    app: tauri::AppHandle,
+    state: SharedState,
+    whisper: SharedWhisper,
+    whisper_loading: WhisperLoading,
+    llm: SharedLlm,
+) {
+    // Window ops must run on the main thread on macOS.
     let app_for_window = app.clone();
     app.run_on_main_thread(move || {
         if let Err(e) = position_overlay_bottom_center(&app_for_window) {
             log::warn!("failed to position overlay: {e}");
         }
         if let Some(win) = app_for_window.get_webview_window("overlay") {
-            // set_macos_overlay_level sets level + collection behavior + orderFrontRegardless.
-            // Do NOT call win.show() (makeKeyAndOrderFront) or set_visible_on_all_workspaces
-            // after this — either would overwrite the collection behavior we just set.
             #[cfg(target_os = "macos")]
             set_macos_overlay_level(&win);
             #[cfg(not(target_os = "macos"))]
@@ -37,24 +41,49 @@ pub(crate) fn on_hotkey_press(app: tauri::AppHandle, state: SharedState) {
 
     match AudioRecorder::start() {
         Ok(recorder) => {
+            // Capture focused field context NOW, while the target app still has
+            // focus (before the overlay animates in or any click shifts focus).
+            #[cfg(target_os = "macos")]
+            let context = crate::ax::read_context(500);
+            #[cfg(not(target_os = "macos"))]
+            let context: Option<String> = None;
+
             {
                 let mut s = state.lock().unwrap();
                 s.recorder = Some(recorder);
+                s.context = context;
             }
             emit_state(&app, NeumaState::Listening { mode: ListenMode::Toggle });
 
-            // Poll RMS ~10×/sec and forward to the waveform animation.
+            // Poll ~10×/sec: forward audio level and check for VAD-triggered stop.
             let app_clone = app.clone();
             let state_clone = Arc::clone(&state);
+            let whisper_clone = Arc::clone(&whisper);
+            let loading_clone = Arc::clone(&whisper_loading);
+            let llm_clone = Arc::clone(&llm);
+
             tauri::async_runtime::spawn(async move {
                 loop {
-                    let level = {
+                    let info = {
                         let s = state_clone.lock().unwrap();
-                        s.recorder.as_ref().map(|r| r.level())
+                        s.recorder.as_ref().map(|r| r.vad_info())
                     };
-                    match level {
-                        Some(l) => emit_audio_level(&app_clone, l),
+
+                    match info {
                         None => break,
+                        Some((level, _silence_progress, vad_stopped)) => {
+                            emit_audio_level(&app_clone, level);
+                            if vad_stopped {
+                                run_pipeline(
+                                    app_clone.clone(),
+                                    Arc::clone(&state_clone),
+                                    Arc::clone(&whisper_clone),
+                                    Arc::clone(&loading_clone),
+                                    Arc::clone(&llm_clone),
+                                );
+                                break;
+                            }
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -71,8 +100,21 @@ pub(crate) fn on_hotkey_press(app: tauri::AppHandle, state: SharedState) {
     }
 }
 
-/// Called when the hotkey is released. Stops recording and runs the full pipeline.
+/// Called when the hotkey is released in PTT mode. Kicks off the pipeline.
 pub(crate) fn on_hotkey_release(
+    app: tauri::AppHandle,
+    state: SharedState,
+    whisper: SharedWhisper,
+    whisper_loading: WhisperLoading,
+    llm: SharedLlm,
+) {
+    run_pipeline(app, state, whisper, whisper_loading, llm);
+}
+
+/// Takes the recorder from state and runs the full transcribe → cleanup → inject
+/// pipeline. Safe to call from the VAD loop, Done button, or PTT release — the
+/// `recorder.take()` is idempotent (returns early if already taken).
+pub(crate) fn run_pipeline(
     app: tauri::AppHandle,
     state: SharedState,
     whisper: SharedWhisper,
@@ -104,9 +146,13 @@ pub(crate) fn on_hotkey_release(
         return;
     };
 
-    let (cleanup_mode, cleanup_api_key) = {
-        let s = state.lock().unwrap();
-        (s.settings.cleanup_mode.clone(), s.settings.cleanup_api_key.clone())
+    let (cleanup_mode, cleanup_api_key, context) = {
+        let mut s = state.lock().unwrap();
+        (
+            s.settings.cleanup_mode.clone(),
+            s.settings.cleanup_api_key.clone(),
+            s.context.take(),
+        )
     };
     let cleanup_client = Arc::clone(&state.lock().unwrap().cleanup_client);
     let llm_model = llm.lock().unwrap().clone();
@@ -167,6 +213,7 @@ pub(crate) fn on_hotkey_release(
             &cleanup_api_key,
             cleanup_client,
             llm_model,
+            context,
             &app_clone,
         )
         .await;
@@ -204,6 +251,7 @@ async fn run_cleanup(
     api_key: &str,
     client: Arc<CleanupClient>,
     llm: Option<Arc<super::local_cleanup::LlmCleanupModel>>,
+    context: Option<String>,
     app: &tauri::AppHandle,
 ) -> String {
     match mode {
@@ -211,7 +259,8 @@ async fn run_cleanup(
             if let Some(model) = llm {
                 emit_state(app, NeumaState::Cleaning);
                 let t = transcript.clone();
-                match tokio::task::spawn_blocking(move || model.clean(&t)).await {
+                let ctx = context.clone();
+                match tokio::task::spawn_blocking(move || model.clean(&t, ctx.as_deref())).await {
                     Ok(Ok(cleaned)) => cleaned,
                     Ok(Err(e)) => {
                         log::warn!("local LLM cleanup failed, using raw transcript: {e}");
@@ -242,7 +291,7 @@ async fn run_cleanup(
                 return transcript;
             }
             emit_state(app, NeumaState::Cleaning);
-            match client.clean(&transcript, api_key).await {
+            match client.clean(&transcript, api_key, context.as_deref()).await {
                 Ok(cleaned) => cleaned,
                 Err(e) => {
                     log::warn!("cloud cleanup failed, using raw transcript: {e}");

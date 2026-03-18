@@ -191,10 +191,8 @@ extern "C" fn tap_callback(
             s.held = true;
 
             if s.session_active && !s.ptt_mode {
-                // Second tap in toggle mode → stop
-                s.cancel_timer();
-                s.session_active = false;
-                Action::Stop(Arc::clone(&s.on_stop))
+                // Second tap in toggle mode — VAD or Done button handles stop.
+                Action::Nothing
             } else if !s.session_active {
                 // Fresh press → start recording + arm hold timer
                 s.session_active = true;
