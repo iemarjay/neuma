@@ -220,6 +220,21 @@ export default function Settings() {
         )}
       </section>
 
+      <div className="divider" />
+
+      <section className="settings-section">
+        <h2 className="section-title">General</h2>
+        <div className="toggle-row">
+          <span className="toggle-label">Launch at Login</span>
+          <button
+            type="button"
+            className={`toggle ${settings.launch_at_login ? "toggle--on" : "toggle--off"}`}
+            onClick={() => saveSettings({ ...settings, launch_at_login: !settings.launch_at_login })}
+            title="Launch at Login"
+          />
+        </div>
+      </section>
+
       <footer className="settings-footer">
         <span className="version-text">Neuma {appVersion ? `v${appVersion}` : ""}</span>
       </footer>

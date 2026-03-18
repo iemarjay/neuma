@@ -215,7 +215,7 @@ function ModelRow({ label, status }: { label: string; status: ModelStatus }) {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.15 }}
           >
-            Not downloaded
+            Missing
           </motion.span>
         )}
       </AnimatePresence>
