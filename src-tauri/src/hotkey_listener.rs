@@ -1,91 +1,123 @@
-/// Single-key listener with tap-vs-hold mode detection.
+/// Single-key listener with tap-vs-hold detection.
+///
+/// Replaces the rdev-based implementation which crashes on macOS 26+ due to
+/// a bug in rdev's Keyboard::string_from_code (Carbon API incompatibility).
+/// Uses CGEventTap directly — monitors kCGEventFlagsChanged for modifier keys
+/// (Alt/Option, Ctrl, Fn) with no key-to-string conversion.
 ///
 /// One key, two behaviors decided at release time:
-///   Tap  (release < HOLD_THRESHOLD_MS) → toggle mode: recording continues until next tap.
-///   Hold (release ≥ HOLD_THRESHOLD_MS) → push-to-talk: recording stops on release.
+///   Tap  (release < HOLD_THRESHOLD_MS) → toggle mode
+///   Hold (release ≥ HOLD_THRESHOLD_MS) → push-to-talk
 ///
-/// Recording starts immediately on every fresh key press regardless of mode.
-///
-/// Uses rdev (CGEventTap on macOS) — supports fn, standalone Alt/Option, etc.
 /// Requires Accessibility permission on macOS:
 ///   System Settings → Privacy & Security → Accessibility
-///
-/// Valid `key_str` values
-/// ─────────────────────
-///   "fn" / "function"                        → Fn key
-///   "alt" / "option" / "left_alt"            → Left Option / Left Alt
-///   "right_alt" / "altgr" / "right_option"   → Right Option / AltGr
-///   "ctrl" / "control" / "left_ctrl"         → Left Control
-///   "right_ctrl" / "right_control"           → Right Control
 
-use rdev::{listen, Event, EventType, Key};
+use std::ffi::c_void;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
 
-/// Milliseconds a key must be held before it switches to push-to-talk mode.
 const HOLD_THRESHOLD_MS: u64 = 400;
 
-// ─── Key mapping ──────────────────────────────────────────────────────────────
+// ── CoreGraphics / CoreFoundation FFI ────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum PttKey {
-    Fn,
-    Alt,
-    AltRight,
-    CtrlLeft,
-    CtrlRight,
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> *mut c_void,
+        user_info: *mut c_void,
+    ) -> *mut c_void;
+    fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+    fn CGEventGetIntegerValueField(event: *mut c_void, field: i32) -> i64;
+    fn CGEventGetFlags(event: *mut c_void) -> u64;
 }
 
-impl PttKey {
-    fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "fn" | "function" => Some(Self::Fn),
-            "alt" | "option" | "left_alt" | "left_option" => Some(Self::Alt),
-            "right_alt" | "altgr" | "right_option" | "alt_right" => Some(Self::AltRight),
-            "ctrl" | "control" | "left_ctrl" | "left_control" => Some(Self::CtrlLeft),
-            "right_ctrl" | "right_control" => Some(Self::CtrlRight),
-            _ => None,
-        }
-    }
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const c_void,
+        tap: *mut c_void,
+        order: isize,
+    ) -> *mut c_void;
+    fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
+    fn CFRunLoopRun();
+    fn CFRunLoopGetCurrent() -> *mut c_void;
+    static kCFRunLoopCommonModes: *const c_void;
+}
 
-    fn matches(self, key: &Key) -> bool {
-        match (self, key) {
-            (Self::Fn, Key::Function) => true,
-            (Self::Alt, Key::Alt) => true,
-            (Self::AltRight, Key::AltGr) => true,
-            (Self::CtrlLeft, Key::ControlLeft) => true,
-            (Self::CtrlRight, Key::ControlRight) => true,
-            _ => false,
+// kCGEventFlagsChanged = 12
+const CG_EVENT_FLAGS_CHANGED: u32 = 12;
+// kCGSessionEventTap = 1
+const CG_SESSION_EVENT_TAP: u32 = 1;
+// kCGHeadInsertEventTap = 0
+const CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+// kCGEventTapOptionListenOnly = 1  (passive — we never modify events)
+const CG_EVENT_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+// event mask: only kCGEventFlagsChanged
+const CG_MASK_FLAGS_CHANGED: u64 = 1 << CG_EVENT_FLAGS_CHANGED;
+// kCGKeyboardEventKeycode field index
+const CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
+// Tap disabled events
+const CG_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFFFFFE;
+const CG_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFFFFFF;
+
+// macOS virtual key codes (Carbon kVK_*)
+const VK_OPTION: u16 = 58;        // Left Alt / Option
+const VK_RIGHT_OPTION: u16 = 61;  // Right Alt / AltGr
+const VK_CONTROL: u16 = 59;       // Left Control
+const VK_RIGHT_CONTROL: u16 = 62; // Right Control
+const VK_FUNCTION: u16 = 63;      // Fn
+
+// CGEventFlags masks
+const FLAG_OPTION: u64 = 0x0008_0000;   // kCGEventFlagMaskAlternate
+const FLAG_CONTROL: u64 = 0x0004_0000;  // kCGEventFlagMaskControl
+const FLAG_FUNCTION: u64 = 0x0080_0000; // kCGEventFlagMaskSecondaryFn
+
+// ── Key parsing ──────────────────────────────────────────────────────────────
+
+fn parse_key(s: &str) -> (u16, u64) {
+    match s.to_lowercase().as_str() {
+        "fn" | "function" => (VK_FUNCTION, FLAG_FUNCTION),
+        "alt" | "option" | "left_alt" | "left_option" => (VK_OPTION, FLAG_OPTION),
+        "right_alt" | "altgr" | "right_option" | "alt_right" => (VK_RIGHT_OPTION, FLAG_OPTION),
+        "ctrl" | "control" | "left_ctrl" | "left_control" => (VK_CONTROL, FLAG_CONTROL),
+        "right_ctrl" | "right_control" => (VK_RIGHT_CONTROL, FLAG_CONTROL),
+        _ => {
+            log::warn!("Unrecognized key '{s}' — falling back to Alt. \
+                        Valid: fn, alt, right_alt, ctrl, right_ctrl");
+            (VK_OPTION, FLAG_OPTION)
         }
     }
 }
 
-// ─── Shared listener state ────────────────────────────────────────────────────
+// ── Shared state ─────────────────────────────────────────────────────────────
 
-struct State {
-    /// Is the physical key currently held down?
+struct Inner {
     held: bool,
-    /// Are we in an active recording session started by this key?
     session_active: bool,
-    /// Has the current session crossed the hold threshold (PTT mode)?
     ptt_mode: bool,
-    /// Flag to cancel the in-flight hold timer. Set to true to cancel.
     hold_cancel: Option<Arc<AtomicBool>>,
+    target_key_code: u16,
+    target_flag_mask: u64,
+    on_start: Arc<dyn Fn() + Send + Sync>,
+    on_stop: Arc<dyn Fn() + Send + Sync>,
+    on_ptt_mode: Arc<dyn Fn() + Send + Sync>,
+    /// Tap reference kept for re-enabling after OS invalidation.
+    tap_ref: *mut c_void,
 }
 
-impl State {
-    fn new() -> Self {
-        Self {
-            held: false,
-            session_active: false,
-            ptt_mode: false,
-            hold_cancel: None,
-        }
-    }
+// Safety: tap_ref is only accessed from the CGEventTap callback thread.
+// All other fields are behind Mutex<Inner>.
+unsafe impl Send for Inner {}
+unsafe impl Sync for Inner {}
 
+impl Inner {
     fn cancel_timer(&mut self) {
         if let Some(flag) = self.hold_cancel.take() {
             flag.store(true, Ordering::SeqCst);
@@ -93,134 +125,201 @@ impl State {
     }
 }
 
-// ─── Actions resolved outside the mutex lock ─────────────────────────────────
-
-#[derive(Debug)]
 enum Action {
-    /// Start a new recording session and arm the hold timer.
-    StartAndArmTimer(Arc<AtomicBool>),
-    /// Stop the current recording session.
-    Stop,
+    Start {
+        cancel: Arc<AtomicBool>,
+        on_start: Arc<dyn Fn() + Send + Sync>,
+        on_ptt: Arc<dyn Fn() + Send + Sync>,
+        /// *mut Mutex<Inner> as usize — safe to send across threads since
+        /// the Box is leaked for the lifetime of the process.
+        state_ptr: usize,
+    },
+    Stop(Arc<dyn Fn() + Send + Sync>),
     Nothing,
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ── CGEventTap callback ──────────────────────────────────────────────────────
 
-/// Spawns a background thread that listens for the configured key.
+extern "C" fn tap_callback(
+    _proxy: *mut c_void,
+    event_type: u32,
+    event: *mut c_void,
+    user_info: *mut c_void,
+) -> *mut c_void {
+    if user_info.is_null() {
+        return event;
+    }
+
+    // OS disabled the tap (too slow, or Accessibility revoked) — re-enable.
+    if event_type == CG_TAP_DISABLED_BY_TIMEOUT || event_type == CG_TAP_DISABLED_BY_USER_INPUT {
+        let state = unsafe { &*(user_info as *const Mutex<Inner>) };
+        if let Ok(s) = state.try_lock() {
+            if !s.tap_ref.is_null() {
+                unsafe { CGEventTapEnable(s.tap_ref, true) };
+            }
+        }
+        log::warn!("CGEventTap disabled by OS (type {event_type:#x}), re-enabled");
+        return std::ptr::null_mut();
+    }
+
+    if event_type != CG_EVENT_FLAGS_CHANGED || event.is_null() {
+        return event;
+    }
+
+    let state = unsafe { &*(user_info as *const Mutex<Inner>) };
+
+    let key_code =
+        unsafe { CGEventGetIntegerValueField(event, CG_KEYBOARD_EVENT_KEYCODE) as u16 };
+    let flags = unsafe { CGEventGetFlags(event) };
+
+    let action = {
+        let mut s = match state.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+
+        if key_code != s.target_key_code {
+            return event;
+        }
+
+        let pressed = flags & s.target_flag_mask != 0;
+
+        if pressed {
+            if s.held {
+                return event; // OS modifier key-repeat equivalent
+            }
+            s.held = true;
+
+            if s.session_active && !s.ptt_mode {
+                // Second tap in toggle mode → stop
+                s.cancel_timer();
+                s.session_active = false;
+                Action::Stop(Arc::clone(&s.on_stop))
+            } else if !s.session_active {
+                // Fresh press → start recording + arm hold timer
+                s.session_active = true;
+                s.ptt_mode = false;
+                let cancel = Arc::new(AtomicBool::new(false));
+                s.hold_cancel = Some(Arc::clone(&cancel));
+                Action::Start {
+                    cancel,
+                    on_start: Arc::clone(&s.on_start),
+                    on_ptt: Arc::clone(&s.on_ptt_mode),
+                    state_ptr: user_info as usize,
+                }
+            } else {
+                Action::Nothing
+            }
+        } else {
+            if !s.held {
+                return event;
+            }
+            s.held = false;
+            s.cancel_timer();
+
+            if s.session_active && s.ptt_mode {
+                // Push-to-talk release → stop
+                s.session_active = false;
+                s.ptt_mode = false;
+                Action::Stop(Arc::clone(&s.on_stop))
+            } else {
+                // Toggle mode release — keep recording, wait for next press
+                Action::Nothing
+            }
+        }
+    }; // lock released
+
+    match action {
+        Action::Start { cancel, on_start, on_ptt, state_ptr } => {
+            on_start();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(HOLD_THRESHOLD_MS));
+                if !cancel.load(Ordering::SeqCst) {
+                    let state = unsafe { &*(state_ptr as *const Mutex<Inner>) };
+                    let mut s = match state.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    if s.session_active && s.held {
+                        s.ptt_mode = true;
+                        log::debug!("PTT: upgraded to push-to-talk mode");
+                        drop(s);
+                        on_ptt();
+                    }
+                }
+            });
+        }
+        Action::Stop(on_stop) => on_stop(),
+        Action::Nothing => {}
+    }
+
+    event
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/// Spawns a background thread that creates a CGEventTap and runs a CFRunLoop.
 ///
-/// `on_start`    — called when recording should begin (key press, no active session).
-/// `on_stop`     — called when recording should end (tap: second press; hold: release).
-/// `on_ptt_mode` — called when the hold threshold passes and PTT mode is confirmed.
+/// `on_start`    — called when recording should begin.
+/// `on_stop`     — called when recording should end.
+/// `on_ptt_mode` — called when hold threshold is reached (PTT mode confirmed).
 pub fn start_listener<P, R, M>(key_str: &str, on_start: P, on_stop: R, on_ptt_mode: M)
 where
     P: Fn() + Send + Sync + 'static,
     R: Fn() + Send + Sync + 'static,
     M: Fn() + Send + Sync + 'static,
 {
-    let ptt_key = match PttKey::from_str(key_str) {
-        Some(k) => k,
-        None => {
-            log::warn!(
-                "Unrecognized PTT key '{key_str}' — falling back to Fn. \
-                 Valid: fn, alt, right_alt, ctrl, right_ctrl"
-            );
-            PttKey::Fn
-        }
-    };
-
-    let shared = Arc::new(Mutex::new(State::new()));
-    let on_start = Arc::new(on_start);
-    let on_stop = Arc::new(on_stop);
-    let on_ptt_mode = Arc::new(on_ptt_mode);
-
-    // Clone Arcs for the listen closure (the closure is 'static + move)
-    let shared_cb = Arc::clone(&shared);
-    let on_start_cb = Arc::clone(&on_start);
-    let on_stop_cb = Arc::clone(&on_stop);
-    let on_ptt_mode_cb = Arc::clone(&on_ptt_mode);
+    let (target_key_code, target_flag_mask) = parse_key(key_str);
 
     std::thread::spawn(move || {
-        let callback = move |event: Event| {
-            let action = match event.event_type {
-                EventType::KeyPress(ref key) if ptt_key.matches(key) => {
-                    let mut s = shared_cb.lock().unwrap();
-
-                    if s.held {
-                        // OS key-repeat — ignore
-                        return;
-                    }
-                    s.held = true;
-
-                    if s.session_active && !s.ptt_mode {
-                        // Second tap while in toggle mode → stop
-                        s.cancel_timer();
-                        s.session_active = false;
-                        Action::Stop
-                    } else if !s.session_active {
-                        // Fresh press → start recording, arm hold timer
-                        s.session_active = true;
-                        s.ptt_mode = false;
-                        let cancel = Arc::new(AtomicBool::new(false));
-                        s.hold_cancel = Some(Arc::clone(&cancel));
-                        Action::StartAndArmTimer(cancel)
-                    } else {
-                        Action::Nothing
-                    }
-                }
-
-                EventType::KeyRelease(ref key) if ptt_key.matches(key) => {
-                    let mut s = shared_cb.lock().unwrap();
-                    s.held = false;
-                    s.cancel_timer();
-
-                    if s.session_active && s.ptt_mode {
-                        // Push-to-talk release → stop
-                        s.session_active = false;
-                        s.ptt_mode = false;
-                        Action::Stop
-                    } else {
-                        // Toggle mode release → keep recording, wait for next press
-                        Action::Nothing
-                    }
-                }
-
-                _ => return,
-            };
-
-            // Execute actions with the lock released
-            match action {
-                Action::StartAndArmTimer(cancel) => {
-                    on_start_cb();
-
-                    // Arm hold timer: after threshold, mark session as PTT mode
-                    let shared_timer = Arc::clone(&shared_cb);
-                    let on_ptt_mode_timer = Arc::clone(&on_ptt_mode_cb);
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(HOLD_THRESHOLD_MS));
-                        if !cancel.load(Ordering::SeqCst) {
-                            let mut s = shared_timer.lock().unwrap();
-                            // Only upgrade if still actively held in a session
-                            if s.session_active && s.held {
-                                s.ptt_mode = true;
-                                log::debug!("PTT: upgraded to push-to-talk mode");
-                                drop(s); // release lock before calling callback
-                                on_ptt_mode_timer();
-                            }
-                        }
-                    });
-                }
-                Action::Stop => {
-                    on_stop_cb();
-                }
-                Action::Nothing => {}
-            }
+        let inner = Inner {
+            held: false,
+            session_active: false,
+            ptt_mode: false,
+            hold_cancel: None,
+            target_key_code,
+            target_flag_mask,
+            on_start: Arc::new(on_start),
+            on_stop: Arc::new(on_stop),
+            on_ptt_mode: Arc::new(on_ptt_mode),
+            tap_ref: std::ptr::null_mut(),
         };
 
-        if let Err(e) = listen(callback) {
+        // Leak the Box so the pointer is valid for the entire process lifetime.
+        let state: &'static Mutex<Inner> = Box::leak(Box::new(Mutex::new(inner)));
+        let state_ptr = state as *const Mutex<Inner> as *mut c_void;
+
+        let tap = unsafe {
+            CGEventTapCreate(
+                CG_SESSION_EVENT_TAP,
+                CG_HEAD_INSERT_EVENT_TAP,
+                CG_EVENT_TAP_OPTION_LISTEN_ONLY,
+                CG_MASK_FLAGS_CHANGED,
+                tap_callback,
+                state_ptr,
+            )
+        };
+
+        if tap.is_null() {
             log::error!(
-                "Key listener exited (grant Accessibility permission in \
-                 System Settings → Privacy & Security → Accessibility): {e:?}"
+                "CGEventTapCreate returned null — grant Accessibility permission in \
+                 System Settings → Privacy & Security → Accessibility"
             );
+            return;
         }
+
+        // Store tap ref so the callback can re-enable it on invalidation.
+        if let Ok(mut s) = state.lock() {
+            s.tap_ref = tap;
+        }
+
+        let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
+        let rl = unsafe { CFRunLoopGetCurrent() };
+        unsafe {
+            CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
+            CFRunLoopRun(); // blocks this thread indefinitely
+        }
+
+        log::error!("CGEventTap run loop exited unexpectedly — hotkey monitoring stopped");
     });
 }
