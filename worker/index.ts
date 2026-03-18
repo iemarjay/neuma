@@ -7,6 +7,7 @@ export interface Env {
 
 interface CleanupRequest {
   text: string;
+  context?: string;
 }
 
 interface CleanupResponse {
@@ -72,6 +73,10 @@ export default {
       return corsResponse(JSON.stringify({ result: "" }));
     }
 
+    const contextSection = body.context?.trim()
+      ? `\n- If any names or terms in the following document context match phonetically with words in the transcript, use their exact spelling:\nDocument context (text before cursor):\n${body.context.trim()}\n`
+      : "";
+
     const prompt = `You are a voice dictation cleanup engine. Your job is to transform raw speech transcription into clean, natural written text.
 
 Rules:
@@ -82,7 +87,7 @@ Rules:
 - Convert spoken list cues ("one... two..." or "first... second...") into a newline-separated list using "- " bullets
 - Convert "new line" or "new paragraph" into actual line breaks
 - Convert spoken punctuation ("exclamation point", "question mark", "comma", "period") into the actual symbol
-- Do not add, infer, or expand on anything not spoken
+- Do not add, infer, or expand on anything not spoken${contextSection}
 - Output only the cleaned text, nothing else
 
 Text: ${inputText}`;

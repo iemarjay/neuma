@@ -22,8 +22,8 @@ const MAX_OUTPUT_TOKENS: usize = 400;
 const N_CTX: u32 = 2048;
 
 pub struct LlmCleanupModel {
-    backend: LlamaBackend,
     model: LlamaModel,
+    backend: LlamaBackend,
 }
 
 impl LlmCleanupModel {
@@ -37,6 +37,10 @@ impl LlmCleanupModel {
 
     /// Remove filler words and fix punctuation in transcribed text.
     ///
+    /// `context` is optional text already present in the focused field before
+    /// the cursor — used to correct Whisper's phonetic spellings of names and
+    /// domain terms that appear in the document.
+    ///
     /// # Context allocation
     /// A fresh `LlamaContext` (KV cache) is created on every call. This costs
     /// ~20–50ms and ~30 MB of RAM per invocation. For Neuma's use-case —
@@ -45,7 +49,17 @@ impl LlmCleanupModel {
     /// self-referential struct (context borrows model) or an unsafe lifetime
     /// extension, adding significant complexity for marginal gain given typical
     /// dictation frequency (once every several seconds at most).
-    pub fn clean(&self, text: &str) -> Result<String> {
+    pub fn clean(&self, text: &str, context: Option<&str>) -> Result<String> {
+        let context_section = match context {
+            Some(ctx) if !ctx.trim().is_empty() => format!(
+                "\n- If any names or terms in the following document context match \
+phonetically with words in the transcript, use their exact spelling:\n\
+Document context (text before cursor):\n{}\n",
+                ctx.trim()
+            ),
+            _ => String::new(),
+        };
+
         // Llama 3.x instruct format
         let prompt = format!(
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n\
@@ -57,7 +71,8 @@ Rules:\n\
 - Convert spoken list cues (\"one... two...\" or \"first... second...\") into a newline-separated list using \"- \" bullets\n\
 - Convert \"new line\" or \"new paragraph\" into actual line breaks\n\
 - Convert spoken punctuation (\"exclamation point\", \"question mark\", \"comma\", \"period\") into the actual symbol\n\
-- Do not add, infer, or expand on anything not spoken\n\
+- Do not add, infer, or expand on anything not spoken\
+{context_section}\
 - Output only the cleaned text, nothing else<|eot_id|>\
 <|start_header_id|>user<|end_header_id|>\n\n\
 {text}<|eot_id|>\
@@ -66,7 +81,7 @@ Rules:\n\
 
         let tokens: Vec<LlamaToken> = self
             .model
-            .str_to_token(&prompt, AddBos::Always)
+            .str_to_token(&prompt, AddBos::Never)
             .context("failed to tokenise prompt")?;
 
         let n_prompt = tokens.len();

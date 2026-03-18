@@ -8,6 +8,8 @@ const CLEANUP_WORKER_URL: &str = "https://neuma-cleanup.emarjay921.workers.dev";
 #[derive(Serialize)]
 struct CleanupRequest<'a> {
     text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -40,14 +42,15 @@ impl CleanupClient {
     }
 
     /// Send `text` to the CF Worker cleanup endpoint and return cleaned text.
-    pub async fn clean(&self, text: &str, api_key: &str) -> Result<String> {
+    /// `context` is optional text before the cursor for context-aware spelling.
+    pub async fn clean(&self, text: &str, api_key: &str, context: Option<&str>) -> Result<String> {
         let url = format!("{}/cleanup", CLEANUP_WORKER_URL);
 
         let resp = self
             .client
             .post(&url)
             .header("X-API-Key", api_key)
-            .json(&CleanupRequest { text })
+            .json(&CleanupRequest { text, context })
             .send()
             .await
             .with_context(|| format!("failed to POST to cleanup worker at {url}"))?;
