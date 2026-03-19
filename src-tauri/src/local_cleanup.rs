@@ -1,68 +1,50 @@
-use anyhow::{Context, Result};
-use llama_cpp_2::{
-    context::params::LlamaContextParams,
-    llama_backend::LlamaBackend,
-    llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
-    sampling::LlamaSampler,
-    token::LlamaToken,
-};
-use std::num::NonZeroU32;
+use anyhow::Result;
 use std::path::Path;
 
-/// Maximum tokens the model is allowed to generate per cleanup call.
-/// Typical dictation outputs 50–200 tokens. 400 gives ample headroom while
-/// staying well within the context window budget.
-const MAX_OUTPUT_TOKENS: usize = 400;
+#[cfg(target_os = "macos")]
+mod imp {
+    use anyhow::{Context, Result};
+    use llama_cpp_2::{
+        context::params::LlamaContextParams,
+        llama_backend::LlamaBackend,
+        llama_batch::LlamaBatch,
+        model::{params::LlamaModelParams, AddBos, LlamaModel},
+        sampling::LlamaSampler,
+        token::LlamaToken,
+    };
+    use std::num::NonZeroU32;
+    use std::path::Path;
 
-/// Context window allocated for the model. Prompt overhead is ~80 tokens,
-/// leaving ~1520 tokens for input. At ~0.75 words/token, that covers ~1140
-/// words — roughly a 4-minute dictation clip. Inputs beyond this are logged
-/// and passed through uncleaned rather than silently truncated mid-sentence.
-const N_CTX: u32 = 2048;
+    const MAX_OUTPUT_TOKENS: usize = 400;
+    const N_CTX: u32 = 2048;
 
-pub struct LlmCleanupModel {
-    model: LlamaModel,
-    backend: LlamaBackend,
-}
-
-impl LlmCleanupModel {
-    pub fn load(path: &Path) -> Result<Self> {
-        let backend = LlamaBackend::init().context("failed to init llama backend")?;
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(99);
-        let model = LlamaModel::load_from_file(&backend, path, &model_params)
-            .with_context(|| format!("llama: failed to load model from {path:?}"))?;
-        Ok(Self { backend, model })
+    pub struct LlmCleanupModel {
+        model: LlamaModel,
+        backend: LlamaBackend,
     }
 
-    /// Remove filler words and fix punctuation in transcribed text.
-    ///
-    /// `context` is optional text already present in the focused field before
-    /// the cursor — used to correct Whisper's phonetic spellings of names and
-    /// domain terms that appear in the document.
-    ///
-    /// # Context allocation
-    /// A fresh `LlamaContext` (KV cache) is created on every call. This costs
-    /// ~20–50ms and ~30 MB of RAM per invocation. For Neuma's use-case —
-    /// one cleanup per dictation, not a continuous generation loop — this is
-    /// acceptable. Reusing the context across calls would require a
-    /// self-referential struct (context borrows model) or an unsafe lifetime
-    /// extension, adding significant complexity for marginal gain given typical
-    /// dictation frequency (once every several seconds at most).
-    pub fn clean(&self, text: &str, context: Option<&str>) -> Result<String> {
-        let context_section = match context {
-            Some(ctx) if !ctx.trim().is_empty() => format!(
-                "\n- If any names or terms in the following document context match \
+    impl LlmCleanupModel {
+        pub fn load(path: &Path) -> Result<Self> {
+            let backend = LlamaBackend::init().context("failed to init llama backend")?;
+            let model_params = LlamaModelParams::default().with_n_gpu_layers(99);
+            let model = LlamaModel::load_from_file(&backend, path, &model_params)
+                .with_context(|| format!("llama: failed to load model from {path:?}"))?;
+            Ok(Self { backend, model })
+        }
+
+        pub fn clean(&self, text: &str, context: Option<&str>) -> Result<String> {
+            let context_section = match context {
+                Some(ctx) if !ctx.trim().is_empty() => format!(
+                    "\n- If any names or terms in the following document context match \
 phonetically with words in the transcript, use their exact spelling:\n\
 Document context (text before cursor):\n{}\n",
-                ctx.trim()
-            ),
-            _ => String::new(),
-        };
+                    ctx.trim()
+                ),
+                _ => String::new(),
+            };
 
-        // Llama 3.x instruct format
-        let prompt = format!(
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n\
+            let prompt = format!(
+                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n\
 You are a voice dictation cleanup engine. Transform raw speech transcription into clean, natural written text.\n\
 \n\
 Rules:\n\
@@ -77,87 +59,102 @@ Rules:\n\
 <|start_header_id|>user<|end_header_id|>\n\n\
 {text}<|eot_id|>\
 <|start_header_id|>assistant<|end_header_id|>\n\n"
-        );
-
-        let tokens: Vec<LlamaToken> = self
-            .model
-            .str_to_token(&prompt, AddBos::Never)
-            .context("failed to tokenise prompt")?;
-
-        let n_prompt = tokens.len();
-
-        // Guard against context overflow. The prompt plus max output must fit
-        // within N_CTX. If the input is too long, return the raw text rather
-        // than crashing or silently truncating mid-sentence.
-        let budget = N_CTX as usize;
-        if n_prompt + MAX_OUTPUT_TOKENS > budget {
-            log::warn!(
-                "cleanup skipped: prompt ({} tokens) + output budget ({}) exceeds n_ctx ({}). \
-                 Returning raw transcript.",
-                n_prompt,
-                MAX_OUTPUT_TOKENS,
-                budget
             );
-            return Ok(text.to_string());
-        }
 
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(N_CTX));
-        let mut ctx = self
-            .model
-            .new_context(&self.backend, ctx_params)
-            .context("failed to create llama context")?;
-
-        let mut batch = LlamaBatch::new(N_CTX as usize, 1);
-        for (i, &token) in tokens.iter().enumerate() {
-            batch
-                .add(token, i as i32, &[0], i == n_prompt - 1)
-                .context("failed to add token to batch")?;
-        }
-        ctx.decode(&mut batch).context("llama decode failed")?;
-
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
-        let mut output = String::new();
-        let mut n_pos = n_prompt as i32;
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-
-        loop {
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
-
-            if self.model.is_eog_token(token) {
-                break;
-            }
-
-            let piece = self
+            let tokens: Vec<LlamaToken> = self
                 .model
-                .token_to_piece(token, &mut decoder, true, None)
-                .unwrap_or_default();
+                .str_to_token(&prompt, AddBos::Never)
+                .context("failed to tokenise prompt")?;
 
-            if piece.contains("<|eot_id|>") {
-                break;
+            let n_prompt = tokens.len();
+
+            let budget = N_CTX as usize;
+            if n_prompt + MAX_OUTPUT_TOKENS > budget {
+                log::warn!(
+                    "cleanup skipped: prompt ({} tokens) + output budget ({}) exceeds n_ctx ({}). \
+                     Returning raw transcript.",
+                    n_prompt,
+                    MAX_OUTPUT_TOKENS,
+                    budget
+                );
+                return Ok(text.to_string());
             }
 
-            output.push_str(&piece);
+            let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(N_CTX));
+            let mut ctx = self
+                .model
+                .new_context(&self.backend, ctx_params)
+                .context("failed to create llama context")?;
 
-            // Hard cap: trim to the last sentence boundary so we don't cut
-            // mid-word. Accept the output as-is if no boundary is found.
-            let generated = n_pos - n_prompt as i32;
-            if generated >= MAX_OUTPUT_TOKENS as i32 {
-                if let Some(pos) = output.rfind(['.', '!', '?', '\n']) {
-                    output.truncate(pos + 1);
-                }
-                break;
+            let mut batch = LlamaBatch::new(N_CTX as usize, 1);
+            for (i, &token) in tokens.iter().enumerate() {
+                batch
+                    .add(token, i as i32, &[0], i == n_prompt - 1)
+                    .context("failed to add token to batch")?;
             }
-
-            batch.clear();
-            batch
-                .add(token, n_pos, &[0], true)
-                .context("failed to add generated token to batch")?;
             ctx.decode(&mut batch).context("llama decode failed")?;
-            n_pos += 1;
-        }
 
-        Ok(output.trim().to_string())
+            let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+            let mut output = String::new();
+            let mut n_pos = n_prompt as i32;
+            let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+            loop {
+                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                sampler.accept(token);
+
+                if self.model.is_eog_token(token) {
+                    break;
+                }
+
+                let piece = self
+                    .model
+                    .token_to_piece(token, &mut decoder, true, None)
+                    .unwrap_or_default();
+
+                if piece.contains("<|eot_id|>") {
+                    break;
+                }
+
+                output.push_str(&piece);
+
+                let generated = n_pos - n_prompt as i32;
+                if generated >= MAX_OUTPUT_TOKENS as i32 {
+                    if let Some(pos) = output.rfind(['.', '!', '?', '\n']) {
+                        output.truncate(pos + 1);
+                    }
+                    break;
+                }
+
+                batch.clear();
+                batch
+                    .add(token, n_pos, &[0], true)
+                    .context("failed to add generated token to batch")?;
+                ctx.decode(&mut batch).context("llama decode failed")?;
+                n_pos += 1;
+            }
+
+            Ok(output.trim().to_string())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use imp::LlmCleanupModel;
+
+/// Stub for non-macOS platforms. Local LLM cleanup uses Metal GPU and
+/// llama-cpp-2, which conflicts with whisper-rs's bundled ggml on Windows/Linux.
+/// On those platforms the cleanup_mode is effectively "disabled" or "cloud".
+#[cfg(not(target_os = "macos"))]
+pub struct LlmCleanupModel;
+
+#[cfg(not(target_os = "macos"))]
+impl LlmCleanupModel {
+    pub fn load(_path: &Path) -> Result<Self> {
+        anyhow::bail!("local LLM cleanup is not supported on this platform")
+    }
+
+    pub fn clean(&self, _text: &str, _context: Option<&str>) -> Result<String> {
+        anyhow::bail!("local LLM cleanup is not supported on this platform")
     }
 }
