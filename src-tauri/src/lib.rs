@@ -5,6 +5,7 @@ mod ax;
 mod cleanup;
 mod commands;
 mod downloader;
+#[cfg(target_os = "macos")]
 mod hotkey_listener;
 mod local_cleanup;
 mod pipeline;
@@ -242,6 +243,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Hotkey listener ───────────────────────────────────────────────────
+    #[cfg(target_os = "macos")]
     {
         let app_press = app.handle().clone();
         let state_press = Arc::clone(&state);

@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 /// Single-key listener with tap-vs-hold detection.
 ///
 /// Replaces the rdev-based implementation which crashes on macOS 26+ due to
