@@ -2,6 +2,14 @@ name = "neuma-cleanup"
 main = "worker/index.ts"
 compatibility_date = "2026-03-16"
 account_id = "9eaa877bd6c6e77ff3913a176e4322a9"
-
 [ai]
 binding = "AI"
+
+# Secrets — set via Wrangler, never committed:
+#   Worker:  npx wrangler secret put API_KEY
+#            npx wrangler secret put BREVO_API_KEY
+#            npx wrangler secret put BREVO_LIST_ID
+#
+#   Pages (account_id must be passed as env var — wrangler.toml is Worker-only):
+#   CLOUDFLARE_ACCOUNT_ID=9eaa877bd6c6e77ff3913a176e4322a9 npx wrangler pages secret put BREVO_API_KEY --project-name neuma-landing
+#   CLOUDFLARE_ACCOUNT_ID=9eaa877bd6c6e77ff3913a176e4322a9 npx wrangler pages secret put BREVO_LIST_ID --project-name neuma-landing

@@ -3,6 +3,8 @@
 export interface Env {
   AI: Ai;
   API_KEY: string;
+  BREVO_API_KEY: string;
+  BREVO_LIST_ID: string; // numeric list ID from Brevo dashboard, stored as string
 }
 
 interface CleanupRequest {
@@ -47,6 +49,11 @@ export default {
 
     if (url.pathname === "/ping") {
       return corsResponse(JSON.stringify({ ok: true }));
+    }
+
+    // Public endpoint — no API key required
+    if (url.pathname === "/subscribe") {
+      return handleSubscribe(request, env);
     }
 
     if (url.pathname !== "/cleanup") {
@@ -129,3 +136,52 @@ Text: ${inputText}`;
     return corsResponse(JSON.stringify(responseBody));
   },
 };
+
+async function handleSubscribe(request: Request, env: Env): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+  if (request.method !== "POST") {
+    return corsResponse(JSON.stringify({ error: "method not allowed" }), 405);
+  }
+
+  let body: { email?: string };
+  try {
+    body = (await request.json()) as { email?: string };
+  } catch {
+    return corsResponse(JSON.stringify({ error: "invalid JSON body" }), 400);
+  }
+
+  const email = (body.email ?? "").trim().toLowerCase();
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return corsResponse(JSON.stringify({ error: "invalid email" }), 400);
+  }
+
+  if (!env.BREVO_API_KEY) {
+    console.error("BREVO_API_KEY not set");
+    return corsResponse(JSON.stringify({ error: "server misconfiguration" }), 500);
+  }
+
+  const listId = parseInt(env.BREVO_LIST_ID ?? "0", 10);
+  const payload: Record<string, unknown> = { email, updateEnabled: true };
+  if (listId > 0) payload.listIds = [listId];
+
+  const brevoRes = await fetch("https://api.brevo.com/v3/contacts", {
+    method: "POST",
+    headers: {
+      "api-key": env.BREVO_API_KEY,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  // 201 = created, 204 = already exists and updated
+  if (brevoRes.status === 201 || brevoRes.status === 204) {
+    return corsResponse(JSON.stringify({ ok: true }));
+  }
+
+  const errBody = await brevoRes.text();
+  console.error("Brevo error", brevoRes.status, errBody);
+  return corsResponse(JSON.stringify({ error: "failed to subscribe" }), 502);
+}
