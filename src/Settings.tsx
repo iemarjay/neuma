@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 interface Settings {
   hotkey: string;
   cleanup_api_key: string;
-  cleanup_mode: string; // "disabled" | "local" | "cloud"
+  cleanup_mode: string; // "disabled" | "cloud"
   launch_at_login: boolean;
 }
 
@@ -35,8 +35,6 @@ export default function Settings() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [modelDownloaded, setModelDownloaded] = useState(false);
   const [downloadState, setDownloadState] = useState<DownloadState>({ kind: "idle" });
-  const [llmDownloaded, setLlmDownloaded] = useState(false);
-  const [llmDownloadState, setLlmDownloadState] = useState<DownloadState>({ kind: "idle" });
   const [testState, setTestState] = useState<TestState>({ kind: "idle" });
   const [appVersion, setAppVersion] = useState("");
 
@@ -44,7 +42,6 @@ export default function Settings() {
     document.body.classList.add("settings-window");
     invoke<Settings>("get_settings").then(setSettings);
     invoke<ModelStatus>("get_model_status").then((s) => setModelDownloaded(s.downloaded));
-    invoke<ModelStatus>("get_llm_model_status").then((s) => setLlmDownloaded(s.downloaded));
     invoke<string>("get_app_version").then(setAppVersion);
 
     const unlistenProgress = listen<DownloadProgress>("neuma://download-progress", (e) => {
@@ -58,25 +55,11 @@ export default function Settings() {
       setDownloadState({ kind: "error", message: e.payload.message });
     });
 
-    const unlistenLlmProgress = listen<DownloadProgress>("neuma://llm-download-progress", (e) => {
-      setLlmDownloadState({ kind: "downloading", progress: e.payload });
-    });
-    const unlistenLlmComplete = listen<void>("neuma://llm-download-complete", () => {
-      setLlmDownloaded(true);
-      setLlmDownloadState({ kind: "idle" });
-    });
-    const unlistenLlmError = listen<{ message: string }>("neuma://llm-download-error", (e) => {
-      setLlmDownloadState({ kind: "error", message: e.payload.message });
-    });
-
     return () => {
       document.body.classList.remove("settings-window");
       unlistenProgress.then((f) => f());
       unlistenComplete.then((f) => f());
       unlistenError.then((f) => f());
-      unlistenLlmProgress.then((f) => f());
-      unlistenLlmComplete.then((f) => f());
-      unlistenLlmError.then((f) => f());
     };
   }, []);
 
@@ -107,21 +90,6 @@ export default function Settings() {
   const handleCancelDownload = async () => {
     await invoke("cancel_model_download");
     setDownloadState({ kind: "idle" });
-  };
-
-  const handleLlmDownload = async () => {
-    setLlmDownloadState({
-      kind: "downloading",
-      progress: { downloaded: 0, total: 900_000_000, speedBps: 0, etaSecs: 0 },
-    });
-    await invoke("download_llm_model").catch((e) => {
-      setLlmDownloadState({ kind: "error", message: String(e) });
-    });
-  };
-
-  const handleCancelLlmDownload = async () => {
-    await invoke("cancel_llm_model_download");
-    setLlmDownloadState({ kind: "idle" });
   };
 
   const handleTestConnection = async () => {
@@ -156,33 +124,17 @@ export default function Settings() {
         <h2 className="section-title">Text Cleanup</h2>
 
         <div className="mode-selector">
-          {(["disabled", "local", "cloud"] as const).map((mode) => (
+          {(["disabled", "cloud"] as const).map((mode) => (
             <button
               key={mode}
               type="button"
               className={`mode-btn ${settings.cleanup_mode === mode ? "mode-btn--active" : ""}`}
               onClick={() => handleModeChange(mode)}
             >
-              {mode === "disabled" ? "Off" : mode === "local" ? "Local" : "Cloud"}
+              {mode === "disabled" ? "Off" : "Cloud"}
             </button>
           ))}
         </div>
-
-        {settings.cleanup_mode === "local" && (
-          <div className="cleanup-sub">
-            <p className="cleanup-hint">
-              Runs Qwen 2.5 1.5B on-device — no network required.
-            </p>
-            <ModelSection
-              name="Qwen 2.5 1.5B"
-              sizeMb={900}
-              downloaded={llmDownloaded}
-              downloadState={llmDownloadState}
-              onDownload={handleLlmDownload}
-              onCancel={handleCancelLlmDownload}
-            />
-          </div>
-        )}
 
         {settings.cleanup_mode === "cloud" && (
           <div className="cleanup-sub">
@@ -218,6 +170,24 @@ export default function Settings() {
             </div>
           </div>
         )}
+      </section>
+
+      <div className="divider" />
+
+      <section className="settings-section">
+        <h2 className="section-title">Hotkey</h2>
+        <div className="mode-selector">
+          {(["fn", "alt", "right_alt", "ctrl", "right_ctrl"] as const).map((key) => (
+            <button
+              key={key}
+              type="button"
+              className={`mode-btn ${settings.hotkey === key ? "mode-btn--active" : ""}`}
+              onClick={() => saveSettings({ ...settings, hotkey: key })}
+            >
+              {key === "fn" ? "Fn" : key === "alt" ? "Alt" : key === "right_alt" ? "R.Alt" : key === "ctrl" ? "Ctrl" : "R.Ctrl"}
+            </button>
+          ))}
+        </div>
       </section>
 
       <div className="divider" />

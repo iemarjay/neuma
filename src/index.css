@@ -277,6 +277,82 @@ body.startup-window {
   background: rgba(255, 255, 255, 0.14);
 }
 
+.startup-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.startup-btn--perm {
+  height: 30px;
+  padding: 0 18px;
+  font-size: 12.5px;
+  background: rgba(255, 255, 255, 0.11);
+  border-color: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.80);
+}
+
+.startup-btn--perm:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.17);
+}
+
+/* Expanded status area for permission steps */
+.startup-status-area--perm {
+  min-height: 130px;
+  align-items: center;
+}
+
+/* Permission wizard step */
+.startup-perm-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 0 2px;
+  width: 100%;
+}
+
+.startup-perm-icon {
+  font-size: 26px;
+  line-height: 1;
+  margin-bottom: 2px;
+}
+
+.startup-perm-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.90);
+  letter-spacing: -0.01em;
+}
+
+.startup-perm-desc {
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.42);
+  text-align: center;
+  line-height: 1.55;
+  max-width: 200px;
+  margin-bottom: 4px;
+}
+
+/* Progress dots */
+.startup-perm-dots {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.startup-perm-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.20);
+  transition: background 0.2s;
+}
+
+.startup-perm-dot--active {
+  background: rgba(255, 255, 255, 0.75);
+}
+
 .startup-model-rows {
   display: flex;
   flex-direction: column;
@@ -386,6 +462,7 @@ body.settings-window {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  width: 350px;
 }
 
 .section-title {
