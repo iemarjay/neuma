@@ -7,7 +7,6 @@ mod commands;
 mod downloader;
 #[cfg(target_os = "macos")]
 mod hotkey_listener;
-mod local_cleanup;
 mod pipeline;
 mod settings;
 mod transcribe;
@@ -17,10 +16,10 @@ mod window;
 
 use audio::AudioRecorder;
 use cleanup::CleanupClient;
-use local_cleanup::LlmCleanupModel;
 use settings::Settings;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_store::StoreExt;
@@ -56,30 +55,42 @@ struct AudioLevelPayload {
 struct AppState {
     settings: Settings,
     recorder: Option<AudioRecorder>,
-    cleanup_client: Arc<CleanupClient>,
+    cleanup_client: Option<Arc<CleanupClient>>,
     download_cancel: Arc<AtomicBool>,
-    llm_download_cancel: Arc<AtomicBool>,
     /// Text before the cursor captured at recording start, used for context-aware cleanup.
     context: Option<String>,
 }
 
 impl AppState {
     fn new(settings: Settings) -> Self {
+        let cleanup_client = CleanupClient::from_settings(
+            &settings.cleanup_mode,
+            &settings.ollama_url,
+            &settings.ollama_model,
+        )
+        .map(Arc::new);
         Self {
             settings,
             recorder: None,
-            cleanup_client: Arc::new(CleanupClient::new()),
+            cleanup_client,
             download_cancel: Arc::new(AtomicBool::new(false)),
-            llm_download_cancel: Arc::new(AtomicBool::new(false)),
             context: None,
         }
+    }
+
+    pub(crate) fn rebuild_cleanup_client(&mut self) {
+        self.cleanup_client = CleanupClient::from_settings(
+            &self.settings.cleanup_mode,
+            &self.settings.ollama_url,
+            &self.settings.ollama_model,
+        )
+        .map(Arc::new);
     }
 }
 
 type SharedState = Arc<Mutex<AppState>>;
 type SharedWhisper = Arc<Mutex<Option<Arc<WhisperModel>>>>;
 type WhisperLoading = Arc<AtomicBool>;
-type SharedLlm = Arc<Mutex<Option<Arc<LlmCleanupModel>>>>;
 
 // Prevents Cmd+Q from quitting — only "Quit Neuma" in the tray is honoured.
 struct ExplicitQuit(AtomicBool);
@@ -109,12 +120,14 @@ pub fn run() {
             commands::get_model_status,
             commands::download_model,
             commands::cancel_model_download,
-            commands::get_llm_model_status,
-            commands::download_llm_model,
-            commands::cancel_llm_model_download,
+            commands::get_ollama_status,
             commands::test_cleanup_connection,
             commands::open_settings_window,
             commands::stop_recording_and_transcribe,
+            commands::check_permissions,
+            commands::request_permissions,
+            commands::check_mic_permission,
+            commands::open_microphone_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Neuma")
@@ -192,31 +205,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         log::warn!("Whisper model not found — open Settings to download it");
     }
 
-    // ── LLM cleanup model ─────────────────────────────────────────────────
-    let shared_llm: SharedLlm = Arc::new(Mutex::new(None));
-    app.manage(shared_llm.clone());
-
-    let llm_missing = settings.cleanup_mode == "local" && downloader::find_llm_model(app.handle()).is_none();
-    if settings.cleanup_mode == "local" {
-        if let Some(llm_path) = downloader::find_llm_model(app.handle()) {
-            let l = Arc::clone(&shared_llm);
-            let app_llm = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                log::info!("loading LLM cleanup model from {llm_path:?}");
-                match tokio::task::spawn_blocking(move || LlmCleanupModel::load(&llm_path)).await {
-                    Ok(Ok(m)) => {
-                        *l.lock().unwrap() = Some(Arc::new(m));
-                        log::info!("LLM ready");
-                        let _ = app_llm.emit("neuma://llm-model-ready", ());
-                    }
-                    Ok(Err(e)) => log::error!("LLM load error: {e:#}"),
-                    Err(e) => log::error!("LLM load panicked: {e}"),
-                }
-            });
-        } else {
-            log::warn!("LLM cleanup model not found — open Settings to download it");
-        }
-    }
+    // Local LLM cleanup uses Ollama (no in-process model loading needed).
 
     // ── Windows ───────────────────────────────────────────────────────────
     // Overlay: created hidden — first hotkey press just calls .show(), no latency.
@@ -229,74 +218,71 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Tray ─────────────────────────────────────────────────────────────
-    let ax_trusted = window::ax_is_process_trusted();
-    let tray_state = tray::build_tray(app.handle(), Arc::clone(&state), ax_trusted)?;
+    let permission_granted = window::listening_permission_granted();
+    let tray_state = tray::build_tray(app.handle(), Arc::clone(&state), permission_granted)?;
     app.manage(Mutex::new(tray_state));
 
-    if !ax_trusted {
-        let _ = app
-            .notification()
-            .builder()
-            .title("Neuma — Action Required")
-            .body("Grant Accessibility access so Neuma can detect your hotkey. Open the tray menu to continue.")
-            .show();
-    }
-
-    // ── Hotkey listener ───────────────────────────────────────────────────
+    // ── Hotkey listener (conditional on permission) ───────────────────────
+    // On macOS 14.2+: needs Input Monitoring (CGPreflightListenEventAccess).
+    // On older macOS: needs Accessibility (AXIsProcessTrusted).
+    // If already granted, start the tap immediately.
+    // If not, poll every second; start the tap once granted — no relaunch needed.
     #[cfg(target_os = "macos")]
     {
-        let app_press = app.handle().clone();
+        let hotkey = settings.hotkey.clone();
+
+        // Pre-clone all Arcs so they can be moved into either branch.
+        let app_press   = app.handle().clone();
         let state_press = Arc::clone(&state);
-        let whisper_press = Arc::clone(&shared_whisper);
-        let loading_press = Arc::clone(&whisper_loading);
-        let llm_press = Arc::clone(&shared_llm);
-        let app_release = app.handle().clone();
+        let w_press     = Arc::clone(&shared_whisper);
+        let l_press     = Arc::clone(&whisper_loading);
+        let app_release   = app.handle().clone();
         let state_release = Arc::clone(&state);
-        let whisper_release = Arc::clone(&shared_whisper);
-        let loading_release = Arc::clone(&whisper_loading);
-        let llm_release = Arc::clone(&shared_llm);
+        let w_release     = Arc::clone(&shared_whisper);
+        let l_release     = Arc::clone(&whisper_loading);
         let app_ptt = app.handle().clone();
 
-        hotkey_listener::start_listener(
-            &settings.hotkey,
-            move || pipeline::on_hotkey_press(
-                app_press.clone(),
-                Arc::clone(&state_press),
-                Arc::clone(&whisper_press),
-                Arc::clone(&loading_press),
-                Arc::clone(&llm_press),
-            ),
-            move || pipeline::on_hotkey_release(
-                app_release.clone(),
-                Arc::clone(&state_release),
-                Arc::clone(&whisper_release),
-                Arc::clone(&loading_release),
-                Arc::clone(&llm_release),
-            ),
-            move || window::emit_state(&app_ptt, NeumaState::Listening { mode: ListenMode::Ptt }),
-        );
-        log::info!("hotkey listener started for key: {}", settings.hotkey);
+        if permission_granted {
+            hotkey_listener::start_listener(
+                &hotkey,
+                move || pipeline::on_hotkey_press(app_press.clone(), Arc::clone(&state_press), Arc::clone(&w_press), Arc::clone(&l_press)),
+                move || pipeline::on_hotkey_release(app_release.clone(), Arc::clone(&state_release), Arc::clone(&w_release), Arc::clone(&l_release)),
+                move || window::emit_state(&app_ptt, NeumaState::Listening { mode: ListenMode::Ptt }),
+            );
+            log::info!("hotkey listener started for key: {hotkey}");
+        } else {
+            let app_h = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let granted = window::listening_permission_granted();
+                    let _ = app_h.emit("neuma://permissions", serde_json::json!({ "granted": granted }));
+                    if granted {
+                        hotkey_listener::start_listener(
+                            &hotkey,
+                            move || pipeline::on_hotkey_press(app_press.clone(), Arc::clone(&state_press), Arc::clone(&w_press), Arc::clone(&l_press)),
+                            move || pipeline::on_hotkey_release(app_release.clone(), Arc::clone(&state_release), Arc::clone(&w_release), Arc::clone(&l_release)),
+                            move || window::emit_state(&app_ptt, NeumaState::Listening { mode: ListenMode::Ptt }),
+                        );
+                        log::info!("hotkey listener started for key: {hotkey}");
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     // ── Hide from Dock ────────────────────────────────────────────────────
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-    // ── First-run: open Settings if any required model is missing ─────────
-    // If a model is missing the startup window will show the download UI — no
-    // need to auto-open Settings here.
-    if whisper_missing || llm_missing {
-        let body = match (whisper_missing, llm_missing) {
-            (true, true) => "Whisper and the local AI model need to be downloaded. Open Settings from the startup window to get started.",
-            (true, false) => "The Whisper transcription model needs to be downloaded. Open Settings from the startup window to get started.",
-            (false, true) => "The local AI cleanup model needs to be downloaded. Open Settings to get started.",
-            _ => unreachable!(),
-        };
+    // ── First-run: notify if Whisper model is missing ─────────────────────
+    if whisper_missing {
         let _ = app
             .notification()
             .builder()
             .title("Neuma — Download Required")
-            .body(body)
+            .body("The Whisper transcription model needs to be downloaded. Open Settings from the startup window to get started.")
             .show();
     }
 

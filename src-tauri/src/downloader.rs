@@ -11,9 +11,6 @@ const MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin";
 const MODEL_FILENAME: &str = "ggml-whisper-turbo.bin";
 
-const LLM_MODEL_URL: &str =
-    "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
-const LLM_MODEL_FILENAME: &str = "llama-3.2-1b-instruct-q4_k_m.gguf";
 
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -60,37 +57,6 @@ pub fn find_model(app: &AppHandle, custom_path: Option<&str>) -> Option<PathBuf>
         let mut dir = cwd.as_path();
         for _ in 0..4 {
             let candidate = dir.join("models").join(MODEL_FILENAME);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            match dir.parent() {
-                Some(p) => dir = p,
-                None => break,
-            }
-        }
-    }
-
-    None
-}
-
-pub fn llm_model_path(app: &AppHandle) -> PathBuf {
-    if let Ok(data_dir) = app.path().app_data_dir() {
-        return data_dir.join("models").join(LLM_MODEL_FILENAME);
-    }
-    PathBuf::from("models").join(LLM_MODEL_FILENAME)
-}
-
-pub fn find_llm_model(app: &AppHandle) -> Option<PathBuf> {
-    let primary = llm_model_path(app);
-    if primary.exists() {
-        return Some(primary);
-    }
-
-    #[cfg(debug_assertions)]
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut dir = cwd.as_path();
-        for _ in 0..4 {
-            let candidate = dir.join("models").join(LLM_MODEL_FILENAME);
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -256,6 +222,3 @@ pub async fn download_model(app: AppHandle, cancel: Arc<AtomicBool>) -> Result<(
     download_file(&app, MODEL_URL, model_path(&app), "neuma://download", cancel).await
 }
 
-pub async fn download_llm_model(app: AppHandle, cancel: Arc<AtomicBool>) -> Result<()> {
-    download_file(&app, LLM_MODEL_URL, llm_model_path(&app), "neuma://llm-download", cancel).await
-}

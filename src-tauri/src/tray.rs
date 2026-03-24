@@ -1,22 +1,20 @@
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_store::StoreExt;
 
-use super::{ExplicitQuit, NeumaState, SharedState};
-use super::window::{ax_is_process_trusted, emit_state, show_or_create_settings_window};
+use super::{ExplicitQuit, SharedState};
+use super::window::{request_listening_permission, show_or_create_settings_window};
 
 // ─── TrayState ────────────────────────────────────────────────────────────────
 
 /// Keeps the tray icon and its live menu items accessible after setup.
 pub(crate) struct TrayState {
+    #[allow(dead_code)] // must be kept alive to keep the tray icon visible
     pub(crate) tray: tauri::tray::TrayIcon,
     pub(crate) launch_at_login_item: CheckMenuItem<tauri::Wry>,
-    /// Present only when Accessibility was NOT granted at startup (macOS).
-    pub(crate) ax_item: Option<MenuItem<tauri::Wry>>,
 }
 
 // ─── Builder ──────────────────────────────────────────────────────────────────
@@ -24,7 +22,7 @@ pub(crate) struct TrayState {
 pub(crate) fn build_tray(
     app: &tauri::AppHandle,
     _state: SharedState,
-    ax_trusted: bool,
+    permission_granted: bool,
 ) -> tauri::Result<TrayState> {
     let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
 
@@ -40,41 +38,36 @@ pub(crate) fn build_tray(
     let quit_item = MenuItem::with_id(app, "quit", "Quit Neuma", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
 
-    let (menu, ax_item_opt) = if !ax_trusted {
-        let ax_item = MenuItem::with_id(
+    let (menu, _perm_item) = if !permission_granted {
+        let perm_item = MenuItem::with_id(
             app,
-            "open_accessibility",
-            "⚠ Grant Accessibility Access",
+            "grant_permission",
+            "⚠ Grant Hotkey Access",
             true,
             None::<&str>,
         )?;
-        let ax_sep = PredefinedMenuItem::separator(app)?;
+        let perm_sep = PredefinedMenuItem::separator(app)?;
         let m = Menu::with_items(
             app,
-            &[&ax_item, &ax_sep, &settings_item, &launch_item, &sep, &quit_item],
+            &[&perm_item, &perm_sep, &settings_item, &launch_item, &sep, &quit_item],
         )?;
-        (m, Some(ax_item))
+        (m, Some(perm_item))
     } else {
         let m = Menu::with_items(app, &[&settings_item, &launch_item, &sep, &quit_item])?;
         (m, None)
     };
 
-    let tooltip = if ax_trusted {
+    let tooltip = if permission_granted {
         "Neuma — click to open menu"
     } else {
-        "Neuma — ⚠ Accessibility not granted"
+        "Neuma — ⚠ permission not granted"
     };
 
     let tray_icon_bytes = include_bytes!("../icons/tray-icon.png");
     let tray_image = tauri::image::Image::from_bytes(tray_icon_bytes)
         .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
 
-    // Flips to true after AX is granted mid-session (restart required).
-    let ax_restart_required = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ax_restart_for_event = Arc::clone(&ax_restart_required);
-
     let launch_item_clone = launch_item.clone();
-    let ax_item_clone = ax_item_opt.clone();
 
     let tray = TrayIconBuilder::new()
         .icon(tray_image)
@@ -116,47 +109,15 @@ pub(crate) fn build_tray(
                     }
                 }
             }
-            "open_accessibility" => {
-                if ax_restart_for_event.load(Ordering::Relaxed) {
-                    app.exit(0);
-                } else {
-                    #[cfg(target_os = "macos")]
-                    let _ = std::process::Command::new("open")
-                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                        .spawn();
-                }
+            "grant_permission" => {
+                request_listening_permission();
             }
             _ => {}
         })
         .build(app)?;
 
-    // AX poll — if user grants permission after launch, prompt restart.
-    if !ax_trusted {
-        let app_poll = app.clone();
-        tauri::async_runtime::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if ax_is_process_trusted() {
-                    ax_restart_required.store(true, Ordering::Relaxed);
-                    if let Some(ts) = app_poll.try_state::<Mutex<TrayState>>() {
-                        if let Ok(ts) = ts.lock() {
-                            if let Some(ref item) = ts.ax_item {
-                                let _ = item.set_text("↺ Restart Neuma to activate hotkey");
-                            }
-                            let _ = ts.tray.set_tooltip(Some("Neuma — restart to activate hotkey"));
-                        }
-                    }
-                    // Emit Idle so the overlay doesn't stay stuck if it was showing
-                    emit_state(&app_poll, NeumaState::Idle);
-                    break;
-                }
-            }
-        });
-    }
-
     Ok(TrayState {
         tray,
         launch_at_login_item: launch_item,
-        ax_item: ax_item_clone,
     })
 }

@@ -31,5 +31,3 @@ webrtc-vad = "0.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 whisper-rs = { version = "0.11", features = ["metal"] }
-llama-cpp-2 = "0.1"
-encoding_rs = "0.8"

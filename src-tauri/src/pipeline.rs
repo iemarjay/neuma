@@ -2,27 +2,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use audio::AudioRecorder;
-use cleanup::CleanupClient;
 use tauri::Manager;
 
-use super::{audio, cleanup, typer, ListenMode, NeumaState, SharedLlm, SharedState, SharedWhisper, WhisperLoading};
-use tauri_plugin_notification::NotificationExt;
+use super::{audio, typer, ListenMode, NeumaState, SharedState, SharedWhisper, WhisperLoading};
 
 use super::window::{
     emit_audio_level, emit_error, emit_state, hide_overlay_after_delay,
+    mic_permission_status, open_mic_settings, request_mic_permission,
     position_overlay_bottom_center, show_or_create_settings_window,
 };
 #[cfg(target_os = "macos")]
-use super::window::set_macos_overlay_level;
+use super::window::{set_macos_overlay_level, MicStatus};
 
-/// Called when the hotkey is pressed. Shows the overlay, starts recording,
-/// and spawns the VAD polling loop.
-pub(crate) fn on_hotkey_press(
+/// Shows the overlay, starts recording, and spawns the VAD polling loop.
+/// Called after mic permission is confirmed.
+fn start_recording(
     app: tauri::AppHandle,
     state: SharedState,
     whisper: SharedWhisper,
     whisper_loading: WhisperLoading,
-    llm: SharedLlm,
 ) {
     // Window ops must run on the main thread on macOS.
     let app_for_window = app.clone();
@@ -41,8 +39,6 @@ pub(crate) fn on_hotkey_press(
 
     match AudioRecorder::start() {
         Ok(recorder) => {
-            // Capture focused field context NOW, while the target app still has
-            // focus (before the overlay animates in or any click shifts focus).
             #[cfg(target_os = "macos")]
             let context = crate::ax::read_context(500);
             #[cfg(not(target_os = "macos"))]
@@ -55,12 +51,10 @@ pub(crate) fn on_hotkey_press(
             }
             emit_state(&app, NeumaState::Listening { mode: ListenMode::Toggle });
 
-            // Poll ~10×/sec: forward audio level and check for VAD-triggered stop.
             let app_clone = app.clone();
             let state_clone = Arc::clone(&state);
             let whisper_clone = Arc::clone(&whisper);
             let loading_clone = Arc::clone(&whisper_loading);
-            let llm_clone = Arc::clone(&llm);
 
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -68,7 +62,6 @@ pub(crate) fn on_hotkey_press(
                         let s = state_clone.lock().unwrap();
                         s.recorder.as_ref().map(|r| r.vad_info())
                     };
-
                     match info {
                         None => break,
                         Some((level, _silence_progress, vad_stopped)) => {
@@ -79,7 +72,6 @@ pub(crate) fn on_hotkey_press(
                                     Arc::clone(&state_clone),
                                     Arc::clone(&whisper_clone),
                                     Arc::clone(&loading_clone),
-                                    Arc::clone(&llm_clone),
                                 );
                                 break;
                             }
@@ -91,14 +83,66 @@ pub(crate) fn on_hotkey_press(
         }
         Err(e) => {
             log::error!("failed to start audio recorder: {e}");
-            emit_error(
-                &app,
-                "Microphone not found or access denied. Check System Settings → Privacy → Microphone.",
-            );
+            emit_error(&app, "Microphone not found. Check your audio input device.");
             hide_overlay_after_delay(app, Duration::from_secs(2));
         }
     }
 }
+
+/// Shows the startup window with the mic-denied error card.
+fn show_mic_denied(app: &tauri::AppHandle) {
+    use tauri::Emitter;
+    if let Some(win) = app.get_webview_window("startup") {
+        let _ = win.show();
+    }
+    let _ = app.emit("neuma://mic-denied", ());
+    open_mic_settings();
+}
+
+/// Called when the hotkey is pressed. Checks mic permission before recording.
+pub(crate) fn on_hotkey_press(
+    app: tauri::AppHandle,
+    state: SharedState,
+    whisper: SharedWhisper,
+    whisper_loading: WhisperLoading,
+) {
+    // mic_permission_status() is a non-blocking ObjC call — safe on the CGEventTap thread.
+    #[cfg(target_os = "macos")]
+    match mic_permission_status() {
+        MicStatus::Authorized => {
+            start_recording(app, state, whisper, whisper_loading);
+        }
+        MicStatus::NotDetermined => {
+            // Request permission asynchronously — must not block the CGEventTap thread.
+            let app_c = app.clone();
+            let state_c = Arc::clone(&state);
+            let whisper_c = Arc::clone(&whisper);
+            let loading_c = Arc::clone(&whisper_loading);
+            tauri::async_runtime::spawn(async move {
+                let granted = tokio::task::spawn_blocking(request_mic_permission)
+                    .await
+                    .unwrap_or(false);
+                if granted {
+                    start_recording(app_c, state_c, whisper_c, loading_c);
+                } else {
+                    emit_error(&app_c, "Microphone access denied.");
+                    show_mic_denied(&app_c);
+                    hide_overlay_after_delay(app_c, Duration::from_secs(2));
+                }
+            });
+        }
+        MicStatus::Denied | MicStatus::Restricted => {
+            emit_error(&app, "Microphone access denied. Enable it in System Settings.");
+            show_mic_denied(&app);
+            hide_overlay_after_delay(app, Duration::from_secs(2));
+        }
+    }
+
+    // On non-macOS mic permission is always available — record directly.
+    #[cfg(not(target_os = "macos"))]
+    start_recording(app, state, whisper, whisper_loading);
+}
+
 
 /// Called when the hotkey is released in PTT mode. Kicks off the pipeline.
 pub(crate) fn on_hotkey_release(
@@ -106,9 +150,8 @@ pub(crate) fn on_hotkey_release(
     state: SharedState,
     whisper: SharedWhisper,
     whisper_loading: WhisperLoading,
-    llm: SharedLlm,
 ) {
-    run_pipeline(app, state, whisper, whisper_loading, llm);
+    run_pipeline(app, state, whisper, whisper_loading);
 }
 
 /// Takes the recorder from state and runs the full transcribe → cleanup → inject
@@ -119,7 +162,6 @@ pub(crate) fn run_pipeline(
     state: SharedState,
     whisper: SharedWhisper,
     whisper_loading: WhisperLoading,
-    llm: SharedLlm,
 ) {
     let recorder = {
         let mut s = state.lock().unwrap();
@@ -146,16 +188,14 @@ pub(crate) fn run_pipeline(
         return;
     };
 
-    let (cleanup_mode, cleanup_api_key, context) = {
+    let (cleanup_api_key, cleanup_client, context) = {
         let mut s = state.lock().unwrap();
         (
-            s.settings.cleanup_mode.clone(),
             s.settings.cleanup_api_key.clone(),
+            s.cleanup_client.clone(),
             s.context.take(),
         )
     };
-    let cleanup_client = Arc::clone(&state.lock().unwrap().cleanup_client);
-    let llm_model = llm.lock().unwrap().clone();
 
     emit_state(&app, NeumaState::Transcribing);
 
@@ -207,16 +247,7 @@ pub(crate) fn run_pipeline(
         }
 
         // ── Cleanup ───────────────────────────────────────────────────────
-        let final_text = run_cleanup(
-            transcript,
-            &cleanup_mode,
-            &cleanup_api_key,
-            cleanup_client,
-            llm_model,
-            context,
-            &app_clone,
-        )
-        .await;
+        let final_text = run_cleanup(transcript, cleanup_client, &cleanup_api_key, context, &app_clone).await;
 
         // ── Inject ────────────────────────────────────────────────────────
         let text_for_inject = final_text.clone();
@@ -247,58 +278,26 @@ pub(crate) fn run_pipeline(
 
 async fn run_cleanup(
     transcript: String,
-    mode: &str,
+    client: Option<Arc<super::cleanup::CleanupClient>>,
     api_key: &str,
-    client: Arc<CleanupClient>,
-    llm: Option<Arc<super::local_cleanup::LlmCleanupModel>>,
     context: Option<String>,
     app: &tauri::AppHandle,
 ) -> String {
-    match mode {
-        "local" => {
-            if let Some(model) = llm {
-                emit_state(app, NeumaState::Cleaning);
-                let t = transcript.clone();
-                let ctx = context.clone();
-                match tokio::task::spawn_blocking(move || model.clean(&t, ctx.as_deref())).await {
-                    Ok(Ok(cleaned)) => cleaned,
-                    Ok(Err(e)) => {
-                        log::warn!("local LLM cleanup failed, using raw transcript: {e}");
-                        transcript
-                    }
-                    Err(e) => {
-                        log::warn!("local LLM cleanup panicked: {e}");
-                        transcript
-                    }
-                }
-            } else {
-                log::info!("local AI model not available — notifying user");
-                let _ = app
-                    .notification()
-                    .builder()
-                    .title("Neuma — Model Unavailable")
-                    .body("Local AI cleanup model isn't loaded. Open Settings to download it.")
-                    .show();
-                transcript
-            }
+    let Some(client) = client else {
+        return transcript; // cleanup_mode == "disabled"
+    };
+
+    if !client.is_available().await {
+        log::info!("cleanup backend unavailable — skipping");
+        return transcript;
+    }
+
+    emit_state(app, NeumaState::Cleaning);
+    match client.clean(&transcript, api_key, context.as_deref()).await {
+        Ok(cleaned) => cleaned,
+        Err(e) => {
+            log::warn!("cleanup failed, using raw transcript: {e}");
+            transcript
         }
-        "cloud" => {
-            if api_key.is_empty() {
-                return transcript;
-            }
-            if !client.is_online().await {
-                log::info!("offline — skipping cloud cleanup");
-                return transcript;
-            }
-            emit_state(app, NeumaState::Cleaning);
-            match client.clean(&transcript, api_key, context.as_deref()).await {
-                Ok(cleaned) => cleaned,
-                Err(e) => {
-                    log::warn!("cloud cleanup failed, using raw transcript: {e}");
-                    transcript
-                }
-            }
-        }
-        _ => transcript,
     }
 }

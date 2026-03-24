@@ -4,6 +4,14 @@ fn default_cleanup_mode() -> String {
     "disabled".to_string()
 }
 
+fn default_ollama_url() -> String {
+    "auto".to_string()
+}
+
+fn default_ollama_model() -> String {
+    "llama3.2:1b".to_string()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     /// The single key used for both tap-to-toggle and hold-to-push-to-talk.
@@ -18,6 +26,12 @@ pub struct Settings {
     /// Whether to launch Neuma automatically at login.
     #[serde(default)]
     pub launch_at_login: bool,
+    /// Ollama base URL for local cleanup (default: http://localhost:11434).
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+    /// Ollama model to use for local cleanup (default: llama3.2:1b).
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
 }
 
 impl Default for Settings {
@@ -27,6 +41,8 @@ impl Default for Settings {
             cleanup_api_key: String::new(),
             cleanup_mode: "disabled".to_string(),
             launch_at_login: false,
+            ollama_url: "auto".to_string(),
+            ollama_model: default_ollama_model(),
         }
     }
 }
