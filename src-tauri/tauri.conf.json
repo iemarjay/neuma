@@ -25,6 +25,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["ggml-metal.metal"]
+    "resources": ["ggml-metal.metal"],
+    "macOS": {
+      "signingIdentity": "-",
+      "infoPlist": "Info.plist",
+      "entitlements": "Entitlements.plist"
+    }
   }
 }
